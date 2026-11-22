@@ -80,13 +80,13 @@ TieredJITCompiler::TieredJITCompiler(engine::Options options, common::ArenaPool&
 				config_.tier1.backend = fallback;
 			}
 		}
-		// Tier-0 preference order: asmjit, bc, interpreter. The interpreter
+		// Tier-0 preference order: asmjit, tbc, interpreter. The interpreter
 		// tier is always available — the module runs uncompiled until the
 		// background tier-1 promotion swaps in its executable.
 		if (registry->hasBackend("asmjit")) {
 			config_.tier0.backend = "asmjit";
-		} else if (registry->hasBackend("bc")) {
-			config_.tier0.backend = "bc";
+		} else if (registry->hasBackend("tbc")) {
+			config_.tier0.backend = "tbc";
 		} else {
 			config_.tier0.backend = engine::INTERPRETER_BACKEND;
 		}
@@ -212,7 +212,8 @@ void TieredJITCompiler::promoteAsync(std::weak_ptr<engine::details::ModuleState>
 		// The IR and per-module options are owned per call and moved into the
 		// background thread, so concurrent promotions never share state.
 		thread = std::thread([weakState = std::move(state), ir = std::move(ir), config = config_,
-		                      options = std::move(options), &pendingCount = pendingPromotions_, finished]() {
+		                      options = std::move(options), &pendingCount = pendingPromotions_, finished,
+		                      pipeline = &pipeline_]() {
 			try {
 				auto* registry = CompilationBackendRegistry::getInstance();
 				auto* backend = registry->getBackend(config.tier1.backend);
@@ -226,6 +227,8 @@ void TieredJITCompiler::promoteAsync(std::weak_ptr<engine::details::ModuleState>
 				statistics->set("backend.name", config.tier1.backend);
 
 				const auto promotionStart = std::chrono::steady_clock::now();
+				// the graph of the NIR front end has its 0.3 IR built here, for a backend that needs it
+				pipeline->prepareFor(ir, config.tier1.backend, options, statistics.get());
 				auto tier1Executable = backend->compile(ir, dumpHandler, options, statistics.get());
 				statistics->recordTimingMs("compilation.totalMs", promotionStart);
 				tier1Executable->setGeneratedFiles(dumpHandler.getGeneratedFiles());

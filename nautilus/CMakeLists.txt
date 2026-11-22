@@ -12,6 +12,7 @@ set(NAUTILUS_FFI_CLOSURES ${ENABLE_FFI_CLOSURES})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/include/nautilus/common/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/include/nautilus/config.hpp)
 
 add_subdirectory(src)
+add_subdirectory(${PROJECT_SOURCE_DIR}/tools/nir-opt ${CMAKE_CURRENT_BINARY_DIR}/tools/nir-opt)
 
 get_source(nautilus NAUTILUS_SOURCE_FILES)
 
@@ -38,6 +39,8 @@ set_target_properties(nautilus PROPERTIES
 )
 
 target_link_libraries(nautilus PRIVATE fmt::fmt)
+# the extension registry lives in nautilus-nir; plugins register their intrinsics into the one instance in nautilus
+target_link_libraries(nautilus PUBLIC nautilus-nir)
 
 if (ENABLE_LOGGING)
     target_link_libraries(nautilus PRIVATE spdlog::spdlog)
@@ -46,6 +49,11 @@ endif ()
 if (ENABLE_STACKTRACE)
     # Add Backward to your target (either Backward::Interface, Backward::Object, or Backward::Backward)
     target_link_libraries(nautilus PRIVATE Backward::Interface)
+endif ()
+
+if (ENABLE_TBC_BACKEND)
+    # tools/nir-run links the library, so it is added after the target is complete
+    add_subdirectory(${PROJECT_SOURCE_DIR}/tools/nir-run ${CMAKE_CURRENT_BINARY_DIR}/tools/nir-run)
 endif ()
 
 if (ENABLE_TESTS)
@@ -61,7 +69,9 @@ endif ()
 include(GNUInstallDirs)
 add_library(${PROJECT_NAME}::nautilus ALIAS nautilus)
 
-if ((ENABLE_BC_BACKEND OR ENABLE_TBC_BACKEND) AND NOT ENABLE_FFI_CLOSURES AND TARGET dyncallback_s)
+list(APPEND EXPORT_TARGETS nautilus-nir)
+
+if (ENABLE_TBC_BACKEND AND NOT ENABLE_FFI_CLOSURES AND TARGET dyncallback_s)
     list(APPEND EXPORT_TARGETS dyncallback_s)
 endif ()
 

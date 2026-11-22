@@ -50,9 +50,10 @@ Test binaries (Catch2) under `build/<preset>/`:
 | `nautilus/test/execution-tests/nautilus-execution-tests` | end-to-end behavior on every built backend |
 | `nautilus/test/execution-tests/nautilus-tracing-tests` | reference dumps in `nautilus/test/data` (**Clang only**) |
 | `nautilus/test/tracing-tests/nautilus-tracing-unit-tests` | tracer internals |
-| `nautilus/test/ir-pass-tests/nautilus-ir-pass-tests` | each IR pass in isolation |
+| `nautilus/test/ir-pass-tests/nautilus-ir-pass-tests` | each IR pass in isolation, and the NIR → 0.3 IR bridge |
 | `nautilus/test/val-tests/nautilus-value-tests` | `val<T>` semantics |
 | `nautilus/test/common/nautilus-common-tests` | arenas, exception transport, utilities |
+| `nautilus/test/nir-tests/nautilus-nir-tests` | NIR (0.4): data structures, verifier, text form, canonical form and hash, images, option registry, conformance corpus |
 | `plugins/<name>/test/nautilus-<name>-tests` | each plugin (`std`, `simd`, `builtin`, `profiling`, `inlining`, …) |
 
 ```bash
@@ -92,15 +93,17 @@ ctest --test-dir build/dev/plugins/std/test --output-on-failure                #
 | Path | Content |
 |---|---|
 | `nautilus/include/nautilus/` | public API: `val.hpp` and `val_*.hpp`, `Engine.hpp`, `Module.hpp`, `options.hpp`, `region.hpp`, `static.hpp`, `select.hpp`, `function.hpp` |
-| `nautilus/src/nautilus/tracing/` | the tracer: `TraceContext`, `ExecutionTrace`, snapshots, tags (`tag/`), symbolic execution, trace → IR conversion (`phases/TraceToIRConversionPhase.cpp`) |
+| `nautilus/src/nautilus/tracing/` | the tracers: `nir/` (the direct NIR tracer, the default) and the 0.3 `TraceContext`, `ExecutionTrace`, snapshots, tags (`tag/`), symbolic execution, trace → IR conversion (`phases/TraceToIRConversionPhase.cpp`; fallback) |
 | `nautilus/src/nautilus/compiler/` | `CompilationPipeline`, `TieredCompiler` (tier 0 / tier 1 promotion), `Engine.cpp`, dumps and statistics |
 | `nautilus/src/nautilus/compiler/ir/` | the IR (`IRGraph`, `operations/`, `blocks/`) and its passes (`passes/`, run by `IRPassManager`) |
-| `nautilus/src/nautilus/compiler/backends/` | `asmjit` (x86-64, AArch64), `tbc` (threaded bytecode, optional copy-and-patch JIT), `bc` (bytecode), `mlir` (MLIR → LLVM), `cpp` (C++ source + system compiler) |
+| `nautilus/src/nautilus/compiler/backends/` | `asmjit` (x86-64, AArch64), `tbc` (threaded bytecode, optional copy-and-patch JIT), `mlir` (MLIR → LLVM), `cpp` (C++ source + system compiler) |
+| `nautilus/src/nautilus/nir/` | NIR, the 0.4 IR: the engine's default pipeline traces to it and converts it (see its `AGENTS.md`); `compiler/NirToIR.cpp` is the temporary bridge to the 0.3 IR for `mlir` (`tbc`, `cpp` and `asmjit` compile the NIR) |
 | `third_party/asmjit/` | vendored AsmJit with Nautilus patches, marked `[Nautilus]` |
+| `third_party/xxhash/` | vendored xxHash (XXH3-128 for the NIR structural hash) |
 | `plugins/` | `std`, `simd`, `builtin`, `specialization`, `inlining`, `gpu`, `profiling`, each with its own tests |
 | `nautilus/test/` | tests (§3), `data/` reference dumps, `benchmark/`, `fuzz/` |
 | `docs/` | user documentation; `docs/options.md` lists every option |
-| `tools/` | playground, stencil generator for `tbc`, perf helpers |
+| `tools/` | playground, stencil generator for `tbc`, perf helpers, `nir-opt` (`nautilus-nir-opt`: read, verify, print, hash NIR), `nir-run` (`nautilus-nir-run`: compile `.nir` with a NIR backend and run its `; run` directives) |
 
 ## 6. Debugging and measuring
 
@@ -115,6 +118,9 @@ ctest --test-dir build/dev/plugins/std/test --output-on-failure                #
   what the benchmark bot's numbers mean).
 - `engine.backend=<x>` pins a single backend; without it the engine compiles
   tier 0 (`asmjit` where available) and promotes to MLIR in the background.
+- `tracing.nirTracer=false` compiles with the 0.3 pipeline (0.3 tracer and IR
+  passes) instead of the default NIR pipeline: use it to tell a bug of the new
+  front end from one of a backend, and for `dump.after_tracing` / the `ir.*` options.
 
 ## 7. Changes, commits, pull requests
 
@@ -141,9 +147,10 @@ Project skills in `.claude/skills/`:
 | `ir-change` | add or change an IR operation everywhere it must be handled |
 | `perf-investigation` | measure compile time or generated-code quality before and after a change |
 | `regenerate-dumps` | update `nautilus/test/data` reference dumps correctly |
+| `asm-diff` | compare the machine code of the `asmjit` backend before and after a change, or with the 0.3 baseline |
 | `nautilus-review` | review user code written with `val<T>` for tracing and codegen quality |
 
-Subsystem notes: `nautilus/src/nautilus/tracing/AGENTS.md`,
+Subsystem notes: `nautilus/src/nautilus/nir/AGENTS.md`, `nautilus/src/nautilus/tracing/AGENTS.md`,
 `nautilus/src/nautilus/compiler/AGENTS.md`,
 `nautilus/src/nautilus/compiler/backends/AGENTS.md`, `plugins/AGENTS.md`.
 

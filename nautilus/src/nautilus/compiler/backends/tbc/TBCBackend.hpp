@@ -8,7 +8,7 @@ namespace nautilus::compiler::tbc {
  * @brief The TBC (threaded bytecode) backend: a from-scratch, high-performance
  * bytecode interpreter.
  *
- * Compared to the legacy bc backend it uses tail-call (musttail) or
+ * It uses tail-call (musttail) or
  * computed-goto dispatch over one flat instruction stream, interpreter-native
  * calls between module functions (no FFI round trip), a contiguous per-thread
  * VM stack with in-frame allocas, and default-on compare-and-branch fusion and
@@ -23,6 +23,11 @@ public:
 
 	[[nodiscard]] ExceptionPropagationMode getExceptionPropagationMode() const override {
 		return ExceptionPropagationMode::CapturedHostRethrow;
+	}
+
+	/// The NIR the engine's front end produces is compiled natively, by `TBCNirBackend`.
+	[[nodiscard]] bool compilesNir() const override {
+		return true;
 	}
 };
 

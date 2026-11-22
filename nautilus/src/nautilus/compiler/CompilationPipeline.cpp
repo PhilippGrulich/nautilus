@@ -12,6 +12,7 @@
 #include <chrono>
 #include <fmt/chrono.h>
 #include <fmt/core.h>
+#include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
@@ -20,6 +21,7 @@
 #ifdef ENABLE_COMPILER
 
 #include "nautilus/CompilableFunction.hpp"
+#include "nautilus/compiler/NirToIR.hpp"
 #include "nautilus/compiler/ir/passes/AlgebraicSimplificationPass.hpp"
 #include "nautilus/compiler/ir/passes/BlockArgumentPruningPass.hpp"
 #include "nautilus/compiler/ir/passes/BlockMergingPass.hpp"
@@ -37,8 +39,13 @@
 #include "nautilus/compiler/ir/passes/NoThrowInferencePass.hpp"
 #include "nautilus/compiler/ir/passes/StrengthReductionPass.hpp"
 #include "nautilus/compiler/ir/util/GraphVizUtil.hpp"
+#include "nautilus/conversion/Conversion.hpp"
+#include "nautilus/nir/Printer.hpp"
+#include "nautilus/nir/Verifier.hpp"
 #include "nautilus/tracing/CopyAttribution.hpp"
 #include "nautilus/tracing/TraceContext.hpp"
+#include "nautilus/tracing/nir/NirTrace.hpp"
+#include "nautilus/tracing/nir/NirTracer.hpp"
 #include "nautilus/tracing/phases/TraceToIRConversionPhase.hpp"
 #include "nautilus/tracing/tag/SourceLocationResolver.hpp"
 #endif
@@ -154,7 +161,7 @@ void addOptimizationPasses(ir::IRPassManager& passManager, const engine::ModuleO
 		group.push_back(std::make_unique<ir::LocalCSEPass>());
 	}
 	// Opt-in (default off), unlike the two passes above: correct, but
-	// measured to regress the BC interpreter's dispatch-bound cost model
+	// measured to regress the bytecode interpreter's dispatch-bound cost model
 	// (see StrengthReductionPass.hpp) -- may still be worth enabling for
 	// an ALU-bound backend.
 	if (moduleOptions.getOptionOrDefault("ir.enableStrengthReduction", false)) {
@@ -200,7 +207,158 @@ void addOptimizationPasses(ir::IRPassManager& passManager, const engine::ModuleO
 	}
 }
 
+/// The `tracing.*` statistics of one trace, whichever tracer recorded it.
+void recordTracingStatistics(CompilationStatistics& statistics, const tracing::TracingStatistics& t) {
+	statistics.set("tracing.iterations", static_cast<int64_t>(t.iterations));
+	statistics.set("tracing.replayedOperations", static_cast<int64_t>(t.replayedOperations));
+	statistics.set("tracing.snapshots", static_cast<int64_t>(t.snapshots));
+	statistics.set("tracing.operations", static_cast<int64_t>(t.operations));
+	statistics.set("tracing.pausedOperations", static_cast<int64_t>(t.pausedOperations));
+	statistics.set("tracing.copies", static_cast<int64_t>(t.copies()));
+	statistics.set("tracing.copies.construct", static_cast<int64_t>(t.copiesConstruct));
+	statistics.set("tracing.copies.assign", static_cast<int64_t>(t.copiesAssign));
+	statistics.set("tracing.copies.explicit", static_cast<int64_t>(t.copiesExplicit));
+	statistics.set("tracing.scopes", static_cast<int64_t>(t.scopes));
+	statistics.set("tracing.maxScopeIterations", static_cast<int64_t>(t.maxScopeIterations));
+	statistics.set("tracing.firstRun.ms", t.firstRunMs);
+	statistics.set("tracing.rerun.ms", t.rerunMs);
+	statistics.set("tracing.rerun.follow.ms", t.rerunFollowMs);
+	statistics.set("tracing.rerun.record.ms", t.rerunRecordMs);
+	statistics.set("tracing.rerun.paused.ms", t.rerunPausedMs);
+}
+
+/// Throws if `module` does not verify; `what` names the module in the message.
+void verifyOrThrow(const nir::Module& module, const std::string& what, const nir::Module* from = nullptr) {
+	auto diagnostics = nir::verify(module);
+	if (diagnostics.empty()) {
+		return;
+	}
+	std::string message = what + " does not verify:";
+	for (const auto& d : diagnostics) {
+		message += "\n  " + d.str();
+	}
+	message += "\n" + nir::print(module);
+	if (from != nullptr) {
+		message += "\nfrom\n" + nir::print(*from);
+	}
+	throw RuntimeException(message);
+}
+
+/// The conversion of a pre-SSA module (03-conversion-and-passes.md), with its statistics, the verification of its
+/// result when `verify` is set and the recorded attribute bits when `attributesFile` names a file.
+nir::Module convertToSSA(const nir::Module& pre, const engine::ModuleOptions& moduleOptions,
+                         CompilationStatistics* statistics, bool verify, const std::string& attributesFile) {
+	conversion::ConversionStatistics conversionStats;
+	const auto conversionStart = std::chrono::steady_clock::now();
+	nir::Module ssa;
+	try {
+		ssa = conversion::convert(pre, {}, &conversionStats);
+	} catch (const std::exception& e) {
+		if (!verify) {
+			throw;
+		}
+		throw RuntimeException(std::string(e.what()) + "\nwhile converting\n" + nir::print(pre));
+	}
+	if (statistics != nullptr) {
+		statistics->recordTimingMs("conversion.ms", conversionStart);
+		statistics->set("conversion.instructions", static_cast<int64_t>(conversionStats.instructions));
+		statistics->set("conversion.phis", static_cast<int64_t>(conversionStats.phis));
+		statistics->set("conversion.removedPhis", static_cast<int64_t>(conversionStats.removedPhis));
+		statistics->set("conversion.folded", static_cast<int64_t>(conversionStats.folded));
+		statistics->set("conversion.cse", static_cast<int64_t>(conversionStats.cse));
+		statistics->set("conversion.refoldSweeps", static_cast<int64_t>(conversionStats.refoldSweeps));
+		statistics->set("conversion.refoldedInsts", static_cast<int64_t>(conversionStats.refoldedInsts));
+		statistics->set("conversion.deadBlocks", static_cast<int64_t>(conversionStats.deadBlocks));
+		statistics->set("conversion.deadValues", static_cast<int64_t>(conversionStats.deadValues));
+		statistics->set("conversion.foldedBranches", static_cast<int64_t>(conversionStats.foldedBranches));
+		statistics->set("conversion.loops", static_cast<int64_t>(conversionStats.loops));
+	}
+	if (verify) {
+		verifyOrThrow(ssa, "the SSA NIR converted from the trace", &pre);
+	}
+	if (!attributesFile.empty()) {
+		// the guarantee bits the attribute pre-pass derived, one line per internal function: name, bits
+		std::ofstream out(attributesFile, std::ios::app);
+		for (const auto& f : ssa.functions) {
+			if (f.visibility == static_cast<uint8_t>(nir::Visibility::Internal)) {
+				out << ssa.name(f.nameId) << '\t' << (f.attrs & nir::GUARANTEE_MASK) << '\n';
+			}
+		}
+	}
+	(void) moduleOptions;
+	return ssa;
+}
+
 } // namespace
+
+std::shared_ptr<ir::IRGraph> CompilationPipeline::traceToNir(std::list<CompilableFunction>& functions,
+                                                             const engine::ModuleOptions& moduleOptions,
+                                                             CompilationStatistics* statistics,
+                                                             const CompilationUnitID& compilationId,
+                                                             const DumpHandler& dumpHandler) const {
+	const auto frontendStart = std::chrono::steady_clock::now();
+	const auto tracingStart = std::chrono::steady_clock::now();
+	// A trace arena per compile: concurrent compiles never share a bump allocator, and the arena is recycled into the
+	// pool when the handle goes out of scope (the NIR module owns its data, so nothing refers to it afterwards).
+	auto traceArenaHandle = traceArenaPool_->acquire();
+	auto traced = tracing::nirtrace::NirTracer::Trace(functions, moduleOptions, *traceArenaHandle);
+	if (statistics != nullptr) {
+		statistics->recordTimingMs("tracing.ms", tracingStart);
+		recordTracingStatistics(*statistics, traced.statistics);
+	}
+	dumpHandler.dump("after_nir_tracing", "nir", [&]() { return nir::print(traced.module); });
+
+	// The verifier is a debugging tool here: `tracing.verifyNir`, or the `ir.verifyAfterEachPass` hook of the tests.
+	const bool verify = moduleOptions.getOptionOrDefault("tracing.verifyNir", false) ||
+	                    moduleOptions.getOptionOrDefault("ir.verifyAfterEachPass", false);
+	if (verify) {
+		verifyOrThrow(traced.module, "the pre-SSA NIR of the trace");
+	}
+	auto ssa = convertToSSA(traced.module, moduleOptions, statistics, verify,
+	                        moduleOptions.getOptionOrDefault<std::string>("tracing.nirAttributesFile", ""));
+	dumpHandler.dump("after_nir_conversion", "nir", [&]() { return nir::print(ssa); });
+
+	// The graph carries the module to the backend: a NIR backend compiles it as it is, the others get the 0.3 IR built
+	// from it (`lowerToIR`).
+	auto carrier = std::make_shared<ir::IRGraph>(irArenaPool_->acquire(), compilationId);
+	carrier->setNirModule(std::make_shared<const nir::Module>(std::move(ssa)));
+	if (statistics != nullptr) {
+		statistics->recordTimingMs("frontend.totalMs", frontendStart);
+	}
+	return carrier;
+}
+
+void CompilationPipeline::lowerToIR(ir::IRGraph& graph, const engine::ModuleOptions& moduleOptions,
+                                    CompilationStatistics* statistics, DumpHandler& dumpHandler) const {
+	const auto bridgeStart = std::chrono::steady_clock::now();
+	const auto module = std::static_pointer_cast<const nir::Module>(graph.getNirModule());
+	buildIRFromNir(*module, graph, moduleOptions);
+	if (statistics != nullptr) {
+		statistics->recordTimingMs("bridge.ms", bridgeStart);
+		const auto snapshot = ir::computeStatistics(graph);
+		statistics->set("ir.functions", static_cast<int64_t>(snapshot.numFunctions));
+		statistics->set("ir.blocks", static_cast<int64_t>(snapshot.numBlocks));
+		statistics->set("ir.blockArguments", static_cast<int64_t>(snapshot.numBlockArguments));
+		statistics->set("ir.operations", static_cast<int64_t>(snapshot.numOperations));
+	}
+	ir::IRPrintOptions irPrintOptions;
+	dumpHandler.dump("after_ir_creation", "nautilus", [&]() { return graph.toString(irPrintOptions); });
+	if (!moduleOptions.getOptionOrDefault("ir.runPasses", true)) {
+		return;
+	}
+	// The conversion of NIR has done what the optimization passes of 0.3 do; they run only when asked for. What every
+	// backend needs, the exception regions its landing pads come from, always runs.
+	ir::IRPassManager passManager(moduleOptions, &dumpHandler, statistics, &irPrintOptions);
+	if (moduleOptions.getOptionOrDefault("ir.runOptimizationPasses", false)) {
+		addOptimizationPasses(passManager, moduleOptions, IROptimizationLevel::Full);
+	}
+	passManager.addPass(std::make_unique<ir::ExceptionRegionPreparationPass>());
+	if (moduleOptions.getOptionOrDefault("debug", false) || moduleOptions.getOptionOrDefault("perf", false)) {
+		passManager.addPass(std::make_unique<ir::IRLocationPass>());
+	}
+	passManager.run(graph);
+	dumpHandler.dump("after_ir_passes", "nautilus", [&]() { return graph.toString(irPrintOptions); });
+}
 
 std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<CompilableFunction>& functions,
                                                               const engine::ModuleOptions& moduleOptions,
@@ -211,6 +369,22 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 
 	if (statistics != nullptr && !statistics->contains("compilation.unitId")) {
 		statistics->set("compilation.unitId", compilationId);
+	}
+
+	// The default front end: the direct NIR tracer and the conversion. `tracing.nirTracer=false` selects the 0.3
+	// pipeline below, kept as a fallback for one release, and so do the options below.
+	// Debug information and perf need the source tags and region tables of the 0.3 trace, which NIR gets with the debug
+	// producers of M4.9, so `debug`, `perf` and `perf.sample` select it as well.
+	// A backend pinned with `engine.backend` can ask for it too (`CompilationBackend::needs03Frontend`).
+	const auto pinnedBackend = moduleOptions.getOptionOrDefault<std::string>("engine.backend", "");
+	const bool backendNeeds03 = !pinnedBackend.empty() && backends->hasBackend(pinnedBackend) &&
+	                            backends->getBackend(pinnedBackend)->needs03Frontend();
+	const bool needs03Trace = backendNeeds03 || moduleOptions.getOptionOrDefault("dump.copySites", false) ||
+	                          moduleOptions.getOptionOrDefault("debug", false) ||
+	                          moduleOptions.getOptionOrDefault("perf", false) ||
+	                          moduleOptions.getOptionOrDefault("perf.sample", false);
+	if (moduleOptions.getOptionOrDefault("tracing.nirTracer", true) && !needs03Trace) {
+		return traceToNir(functions, moduleOptions, statistics, compilationId, dumpHandler);
 	}
 
 	std::unique_ptr<tracing::SourceLocationResolver> sourceLocationResolver;
@@ -232,11 +406,37 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 	// finished, so this is safe (the IRGraph owns a separate IR arena).
 	auto traceArenaHandle = traceArenaPool_->acquire();
 	common::Arena& arena = *traceArenaHandle;
-	std::shared_ptr<tracing::TraceModule> traceModule = tracing::TraceContext::Trace(functions, moduleOptions, arena);
+	auto traceModule = tracing::TraceContext::Trace(functions, moduleOptions, arena);
 	if (statistics != nullptr) {
 		statistics->recordTimingMs("tracing.ms", tracingStart);
+		recordTracingStatistics(*statistics, traceModule->statistics);
 	}
 	dumpHandler.dump("after_tracing", "trace", [&]() { return traceModule->toString(); });
+	// tracing.nirChain: the trace is also mapped to NIR and converted, for the `nirtbc` pseudo-backend of the tests
+	const auto nirAttributesFile = moduleOptions.getOptionOrDefault<std::string>("tracing.nirAttributesFile", "");
+	const bool nirChain = moduleOptions.getOptionOrDefault("tracing.nirChain", false);
+	std::shared_ptr<const nir::Module> chainModule;
+	if (const bool verifyNir = moduleOptions.getOptionOrDefault("tracing.verifyNir", false) || nirChain;
+	    verifyNir || !nirAttributesFile.empty() || dumpHandler.shouldDump("after_nir_tracing")) {
+		try {
+			auto nirModule = tracing::nirtrace::toPreSSA(*traceModule);
+			dumpHandler.dump("after_nir_tracing", "nir", [&]() { return nir::print(nirModule); });
+			if (verifyNir) {
+				verifyOrThrow(nirModule, "the pre-SSA NIR of the trace");
+			}
+			if (verifyNir || !nirAttributesFile.empty() || statistics != nullptr) {
+				auto ssa = convertToSSA(nirModule, moduleOptions, statistics, verifyNir, nirAttributesFile);
+				if (nirChain) {
+					chainModule = std::make_shared<const nir::Module>(std::move(ssa));
+				}
+			}
+		} catch (const std::exception&) {
+			// a dump must not fail a compilation; the verification exists to fail it
+			if (verifyNir) {
+				throw;
+			}
+		}
+	}
 	// Not part of dump.all: resolving every copy's call stack through the debug information is slow.
 	if (moduleOptions.getOptionOrDefault("dump.copySites", false)) {
 		tracing::SourceLocationResolver copySiteResolver;
@@ -247,6 +447,9 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 	auto ir = tracing::TraceToIRConversionPhase().apply(std::move(traceModule), *irArenaPool_, compilationId);
 	if (statistics != nullptr) {
 		statistics->recordTimingMs("irGeneration.ms", irGenStart);
+	}
+	if (chainModule) {
+		ir->setNirModule(std::move(chainModule));
 	}
 	if (statistics != nullptr) {
 		const auto snapshot = ir::computeStatistics(*ir);
@@ -314,6 +517,20 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 	return ir;
 }
 
+void CompilationPipeline::prepareFor(const std::shared_ptr<ir::IRGraph>& ir, const std::string& backendName,
+                                     const engine::ModuleOptions& moduleOptions,
+                                     CompilationStatistics* statistics) const {
+	const auto backend = backends->getBackend(backendName);
+	// A graph with a NIR module and no functions is the carrier of the NIR front end; one that has functions already
+	// has its 0.3 IR (built for the backend of a previous tier, or by the 0.3 tracer).
+	if (ir->getNirModule() == nullptr || !ir->getFunctionOperations().empty() || backend->compilesNir()) {
+		return;
+	}
+	const auto compilationId = ir->getId();
+	auto dumpHandler = DumpHandler(moduleOptions, compilationId);
+	lowerToIR(*ir, moduleOptions, statistics, dumpHandler);
+}
+
 std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr<ir::IRGraph>& ir,
                                                            const std::string& backendName,
                                                            const engine::ModuleOptions& moduleOptions,
@@ -328,6 +545,7 @@ std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr
 		statistics->set("backend.name", backendName);
 	}
 
+	prepareFor(ir, backendName, moduleOptions, statistics);
 	const auto backend = backends->getBackend(backendName);
 	auto executable = backend->compile(ir, dumpHandler, moduleOptions, statistics);
 	executable->setGeneratedFiles(dumpHandler.getGeneratedFiles());
@@ -345,6 +563,10 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr<ir::IRGraph>&, const std::string&,
                                                            const engine::ModuleOptions&, CompilationStatistics*) const {
 	throw RuntimeException("Jit not initialised");
+}
+
+void CompilationPipeline::prepareFor(const std::shared_ptr<ir::IRGraph>&, const std::string&,
+                                     const engine::ModuleOptions&, CompilationStatistics*) const {
 }
 
 #endif

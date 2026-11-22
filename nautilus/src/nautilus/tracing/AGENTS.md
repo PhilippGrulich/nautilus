@@ -22,3 +22,29 @@ the SSA `IRGraph`. Read `docs/tracing.md` and `docs/region.md` first.
 - **Tests:** `nautilus-tracing-unit-tests` for internals, `nautilus-tracing-tests`
   for dumps, `nautilus-execution-tests` for behavior, the differential fuzzer for
   mixed control flow.
+- **Statistics:** `TraceContext` counts iterations, replayed and paused operations, snapshots and copies by kind
+  (`TracingStatistics.hpp`) and times the first pass and the re-runs, split into follow, record and paused time. The
+  compilation pipeline reports them as `tracing.*` (`engine.logStatistics=true`).
+- **NIR:** `nir/NirTrace.cpp` maps a finished trace to pre-SSA NIR. `tracing.verifyNir=true` runs the NIR verifier
+  on it for every compilation (`NAUTILUS_OPTIONS="tracing.verifyNir=true" ctest --preset dev` checks the mapping on
+  the whole suite); `nautilus-tracing-tests` compares the text with `nautilus/test/data/*/nir`.
+
+## The direct NIR tracer (`tracing/nir/NirTracer`, `FlatTrace`)
+
+Since the cut-over the engine traces with this tracer: it records pre-SSA NIR directly (16-byte records, tag map,
+replay cursor), and `CompilationPipeline::traceToNir` verifies (under `tracing.verifyNir` or the
+`NAUTILUS_IR_VERIFY=1` hook) and converts the module. `tracing.nirTracer=false` selects the 0.3 tracer described above
+(`TraceContext`, `ExecutionTrace`) and the IR passes, kept as a fallback for one release; the `nir-tbc` test backends
+and the dump tests (`nautilus-tracing-tests`, which call `TraceContext::Trace` directly) still use it. When the layout
+puts an assigning block before the block that declared a variable (a constant reached again on the second path),
+`emitFunction` hoists the declaration to the entry block and leaves an assign at the original site.
+`tracing.nirTracer=true` records pre-SSA NIR directly (16-byte records, tag map, replay cursor) instead of the 0.3
+`TraceContext` + `toPreSSA`; the module then goes through verification and conversion into an empty IR graph for the
+`nirtbc` pseudo-backend. Tests run it as the `nir-direct` / `nir-direct-jit` backends, the fuzzer as peers. When the
+layout puts an assigning block before the block that declared a variable (a constant reached again on the second
+path), `emitFunction` hoists the declaration to the entry block and leaves an assign at the original site.
+
+The thread keeps the tables of the NIR tracer between traces (the flat trace, the symbolic execution context, the
+write-out scratch of `emitFunction`), so a trace allocates only what it outgrows; anything new that is per trace belongs
+there too, bounded so that one huge trace does not tax the small ones after it. Measure with `nautilus-compile-bench`
+and callgrind on `nautilus-tracing-corpus` (the `perf-investigation` skill).

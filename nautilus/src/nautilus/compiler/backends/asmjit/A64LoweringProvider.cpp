@@ -2163,8 +2163,16 @@ void AsmJitLoweringProvider::LoweringContext::visitCall(ir::CallOperation* op, R
 				narrowToStamp(toGp(frame.getValue(arg->getIdentifier())), arg->getStamp());
 			}
 		}
-		IntrinsicCallContext ctx {cc, op, frame};
+		std::vector<AsmReg> args;
+		args.reserve(op->getInputArguments().size());
+		for (auto* arg : op->getInputArguments()) {
+			args.push_back(frame.getValue(arg->getIdentifier()));
+		}
+		IntrinsicCallContext ctx {cc, args, std::nullopt};
 		if ((*intrinsic)(ctx)) {
+			if (ctx.result.has_value()) {
+				bindResult(op->getIdentifier(), *ctx.result, frame);
+			}
 			return;
 		}
 	}
@@ -2441,7 +2449,7 @@ void AsmJitLoweringProvider::LoweringContext::visitCast(ir::CastOperation* op, R
 // Potentially-throwing calls are routed through captureThrowingCall<R, Args...>
 // (a real C++ frame) and followed by a pending-exception check that branches to
 // the call's landing pad. Pads and the exceptional exit are emitted after the
-// main CFG, mirroring the X64/BC/TBC/CPP captured backends.
+// main CFG, mirroring the X64/TBC/CPP captured backends.
 
 bool AsmJitLoweringProvider::LoweringContext::callNeedsCapture(const ir::Operation* call) const {
 	if (currentFunction_ == nullptr) {
