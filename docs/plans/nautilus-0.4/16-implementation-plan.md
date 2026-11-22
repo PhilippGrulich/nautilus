@@ -131,7 +131,7 @@ unchanged from the cut-over on, on every enabled backend.
    | `stencil-check` | PR 5 | `tools/stencils/build_stencils.py` output matches the checked-in `tbc` stencil tables for all three targets | always |
    | `asm-diff` | PR 7 | `asmjit` assembly of the corpus against the 0.3 baseline | from PR 7 or PR 6, whichever is later (before the cut-over it would diff 0.3 against itself) |
    | `nebulastream-cache` | PR 13 | the NebulaStream suite cold, then warm, with `ENABLE_CACHE_PLUGIN=ON` (M5.7, [08 §5.1](08-caching.md)), manual or nightly | reports; the M5 exit is checked on the reference machine |
-   | `llvm-ir-test` and the inlining-plugin step (existing) | — | MLIR reference IR and the `inlining` plugin suite | off from PR 6 to PR 8 (M4.5), while MLIR is switched off |
+   | `llvm-ir-test` and the inlining-plugin step (existing) | — | MLIR reference IR and the `inlining` plugin suite | never switched off: MLIR stayed on through the bridge (PR 6), the LLVM IR tests pinned `tracing.nirTracer=false`; on the NIR pipeline with regenerated reference IR from PR 8 (M4.5) |
    | `doc-check` | PR 2 | paths, targets, options and skills named in `AGENTS.md` and skills exist | always |
    | GPU legs (existing) | — | the three `-DENABLE_GPU_PLUGIN=ON` legs | build without the plugin from PR 6 to PR 17 ([17 §3](17-gpu.md)) |
    | `gpu-metal` (existing macOS leg) | PR 17 | the Metal suite on the hosted macOS runner, with Metal API and shader validation | from PR 17 |
@@ -191,6 +191,177 @@ opened as drafts early and kept up to date with the branch.
 | 17 | GPU core ([17](17-gpu.md)): device ops, launch, partition, runtime, memory, errors, grid emulator, CUDA and Metal device compilers | M7.1–M7.4 | 10, 11, 15 | 13–25 |
 | 18 | GPU production features and validation: shared memory, atomics, warp ops, math; device-code caching, artifacts carrying the NIR image; Metal benchmarks and validation tooling, `docs/gpu.md` | M7.5–M7.7 | 13, 17 | 5–12 |
 | 19 | Documentation, migration guide, release validation, merge and tag | M8.1–M8.3 | 13–18 | 2.5–7 |
+
+**State and next steps (end of the autoresearch session; PR 6 is opened since, see its status below).** PRs 1–4 are open as
+a stack (#570 ← #571 ← #572 ← #573, all drafts). Open in them: M2.1's
+direct-recording tracer (#572 maps the 0.3 trace instead), the `NirChain`
+fixture and `useCount` (#573), and the reference machine, the published CI
+image and the callgrind identity check (#571, need an owner). Continue in
+this order:
+
+1. **PR 5 (M4.0, M4.1): backend interface, `nautilus-nir-run`, `tbc` on
+   NIR.** It needs only PR 2, and it is the missing piece for everything
+   open in the stack: `NirChain` (new tracer → conversion → `tbc`) can then
+   check #572 and #573 on every execution test and in the fuzzer.
+2. **`NirChain` and the rest of PR 4** (fixture, fuzz-replay and corpus
+   modes, the `nir-chain` CI leg, `useCount` if M3.8 is near).
+3. **M2.1 proper** (`FlatTrace`, tag map, index-based replay cursor,
+   allocation-counter test), validated through `NirChain`; then M2.0's
+   remaining measurements.
+4. **PR 6 (cut-over)** only when 1–3 are green; then PRs 7–8 in parallel.
+
+Housekeeping first: check that CI is green on the four heads (the
+`baselines-0.3` workflow was fixed on PR 2), and retarget stacked PRs to
+`nautilus-0.4` as their parents merge.
+
+**PR 1 status.** M1.1–M1.6 are implemented on `claude/nir-format-pr1` (code in `nautilus/src/nautilus/nir/`,
+tests in `nautilus/test/nir-tests/`, conformance material in `nautilus/test/data/nir-conformance/`). Where the code
+differs from the work packages above:
+
+- **Load is not zero-copy yet** (M1.5): `loadImage` copies the sections into the `Module` vectors. Zero-copy needs a
+  `Module` that can hold spans over a buffer; it is deferred to the PR that first needs the saving (PR 12, M5.5).
+- **`OptionRegistry` is compiled into `nautilus-nir`** (M1.4a), not into `nautilus`, until the cut-over links the two;
+  `options.hpp` is untouched.
+- **Debug sections** are read and written but dropped by `canonicalize` (M1.4): remapping them needs the debug
+  producers of M4.9.
+- **Not in this PR** (they depend on the registry of PR 2): extension checks `NIR-V070`–`V072`, `NIR-L010`–`L012` and
+  `NIR-L015`. PR 2 adds all of them but `NIR-L015` (portable pointers; no producer yet): images hold image-local
+  extension ids (`ExtensionIds.cpp`; the writer translates, the loader resolves by name and version, the canonical form
+  and the hash go through the writer, so they do not depend on process ids). The extension productions of the text form (M1.3a: `extension` lines, `!` types and bytes constants,
+  extension operations printed and read from their operand shape, intrinsic callees) landed in PR 2 with the registry.
+- **Bundling** (§8.5) is M5.4: `writeImage` serializes imports as they are, which the loader then rejects
+  (`NIR-V038`); the hash input of such a module (§7.3) is written the same way.
+- **Fuzzing:** `nautilus-nir-fuzz` (libFuzzer) and `nautilus-nir-fuzz-replay` (any compiler, deterministic mutation).
+  Five crashes were found and fixed while writing them, and a sixth by the exit run (a canonical form that dropped its
+  only process-local pointer kept the `processToken`, V040); see the commit messages. The one-CPU-hour exit of M1.6 is
+  met: 69.1M executions in 3601 s on the final code without a crash.
+
+**PR 3 status.** Part 1 is on `claude/nir-tracer-pr3`: the mapping from a finished 0.3 trace to pre-SSA NIR
+(`tracing/nir/NirTrace.cpp`, checked by `tracing.verifyNir` over the whole test suite and by golden dumps in
+`test/data/*/nir`), M2.0's statistics, hashed trie children (`distinctSites1024` tracing -67% instructions) and the
+new `TracingInterface` hooks. Not yet: the second recorder that writes `FlatTrace` directly (16-byte records, open
+addressing tag map, index-based replay cursor, no `malloc` per recorded op) and the allocation-counter test. The
+conversion of PR 4 reads pre-SSA NIR from either producer, so it starts from `toPreSSA`; the direct recorder then
+replaces the producer in its own PR. Spec change found on the way: `NIR-V051` counts an `assign` as a write of the
+variable (13 §6.2), because the tracer's reconciling `assign` of #95 writes a variable that the other arm defined.
+
+**The direct recorder (#576, M2.1).** `NirTracer` records pre-SSA NIR into `FlatTrace` and is selected by
+`tracing.nirTracer`; the execution tests and the fuzzer ran it as `nir-direct` until PR 6 made it the default. Evidence, from the tests in
+`nautilus/test/tracing-tests/NirTracerTest.cpp` and `NirTracerAllocationTest.cpp`: golden pre-SSA dumps of ten functions
+(`test/data/nir-trace/`, `NAUTILUS_UPDATE_GOLDEN=1` rewrites them) including a `val` initialised from a constant and
+assigned in a loop, a copy assigned in a loop and #95; the converted SSA of the direct tracer equals that of the 0.3
+tracer plus `toPreSSA` on all of them; and the allocation counter: 0.013 heap allocations per recorded operation in
+steady state (62 for a 6-operation function, 128 for `distinctSites1024`'s 5122). Callgrind instructions per trace
+(`nautilus-tracing-corpus`, Clang 21, Release; `main` at `71ce5f76`, the 0.3 tracer of this branch, and the direct
+tracer including its write-out to a `nir::Module`): `distinctSites1024` 23.2 M / 8.1 M / 8.8 M, `chainedIf100`
+15.6 M / 15.5 M / 12.4 M. So the ≥ 30 % target on `distinctSites1024` is met against `main` (−62 %), and almost all of
+it comes from PR 3's hashed trie: the direct tracer itself costs 9 % more than the 0.3 tracer there, because it also
+builds the module that the 0.3 path builds later (`toPreSSA` or the IR conversion), and 20 % less on `chainedIf100`.
+The shared tag recording (`createReferenceTagBuildin`, trie `append`) is 40 % of what is left. `traceExtOp` records
+extension operations whose operands are values (the conversion does not handle extension instructions yet, so the
+chain stops at the pre-SSA module for them). Not supported by this tracer: `dump.copySites`.
+
+**PR 6 status.** The engine runs the NIR pipeline by default (`claude/nir-cutover-pr6`, stacked on the direct
+tracer of #576): the direct NIR tracer, the conversion, then the backend. `tbc` compiles the SSA module as it is. The
+owner decided to keep a temporary bridge for the backends without a NIR port so that the PR stays reviewable, and that
+changes M4.2 and §2 step 2 as follows:
+
+- **Bridge instead of switch-off.** `asmjit`, `mlir` and `cpp` stay on and get the 0.3 IR built from the SSA module
+  (`compiler/NirToIR.*`, run by `CompilationPipeline::prepareFor`, on the promotion thread for a background tier). It
+  infers the sign of integers (NIR is signless) from the operations and signatures that state it, turns landing pads
+  into the destructor lists of their calls, and runs only the exception-region preparation. The 0.3 backends keep
+  their lowerings; PRs 7 and 8 replace backend and bridge together. A backend that has a NIR port says so with
+  `CompilationBackend::compilesNir()`. Intrinsics need nothing: the 0.3 backends find them by address in the
+  `IntrinsicRegistry`, and `tbc` calls their fallbacks as before.
+- **Nothing is deleted.** The 0.3 pipeline (`TraceContext`, `ExecutionTrace`, the trace-to-IR conversion, `compiler/ir/`
+  with its passes) stays as the fallback `tracing.nirTracer=false` for one release, and so do `NirChain` (`nir-tbc`
+  test backends, which check the mapping from the 0.3 trace) and `test/ir-pass-tests/`. They go with the last 0.3
+  backend (PRs 7 and 8). The sources of no backend are excluded from the build.
+- **D10/D11 on the bridged backends.** The bridge does not apply checked division, masked shifts and saturating
+  float-to-int casts: `asmjit` and `mlir` behave as in 0.3 until their ports. `tbc` applies them, and `cpp` since M4.3.
+- **M4.3 (`cpp` on NIR) is done in PR 7.** `CPPNirLowering` prints C++ from the SSA module and `cpp` returns true from
+  `compilesNir()`, so it leaves the bridge and applies D10/D11 (checked `div`/`rem` through the captured-call `try`,
+  masked shifts, saturating casts as helpers in the source, `memcpy` memory access, no signed overflow). Every
+  execution test passes on it (1035 tests of `ctest --preset dev`). The loop that got there (autoresearch, metric = failing
+  assertions and crashed tests): 1504 for the scaffold that throws, 20 with the lowering, 4 once every function is a
+  symbol under its exact name, 0 with quoted symbols and the statistics tests told that `cpp` compiles NIR. `nautilus-nir-run` calls native executables through dyncall, so the `.nir` corpus (division, shifts, casts, exceptions) also runs on `cpp`; breaking the minimum-divided-by-minus-one check, the shift mask or the saturating NaN case in the lowering fails exactly `division`, `shifts` and `casts`.
+- **M4.4 (`asmjit` on NIR) is done in PR 7b (#579), stacked on #578.** `X64NirLowering` and `A64NirLowering` lower the SSA
+  module to AsmJit's `Compiler` without the 0.3 IR; `asmjit` returns true from `compilesNir()` and registers
+  `AsmJitNirBackend`, so `mlir` is the last backend on the bridge. Allocator, peepholes, options and `asmjit.lowering.*`
+  counters are the 0.3 ones; D10/D11 are explicit (cold block for checked `div`/`rem`, masked narrow shifts, saturating
+  casts); the plugins' intrinsic handlers take an `IntrinsicCallContext` and serve both lowerings. See the notes of
+  `backends/AGENTS.md`. Deferred: the 0.3 providers stay for `legacy-asmjit` until M4.2; the line table of 05 §4.4
+  step 3 and `perf`/`debug` come with M4.9; the callgrind ratio gate of the `latency-corpus` leg needs the pinned CI
+  container (the `asm-diff` leg compares code size against the recorded 0.3 corpus).
+- **M4.5 (`mlir` on NIR) is done in PR 8**, stacked on PR 7, by the same method (the loop: autoresearch, metric = failing assertions
+  and crashed tests of `ctest --preset full`): 1582 for the scaffold that throws (1579 failed assertions, 3 crashed), 9 with the
+  lowering, 0 with the intrinsic handlers on the NIR call and the ABI attributes of arguments (only below 32 bits). `mlir`
+  returns true from `compilesNir()`; `MLIRNirLowering` lowers SSA NIR to `func`/`cf`/`arith`/`llvm` with the checks of D10 (a cold
+  block that calls `nautilus_rt_throw_arith`, masked shifts) and `llvm.fptosi.sat`/`fptoui.sat` (D11); a landing pad is an
+  `llvm.landingpad` block in front of the pad body, which receives the exception as a block argument. The plugins' intrinsic
+  handlers (`std`, `simd`, `builtin`, `specialization`, and the memory ones of the core) take a `NirIntrinsicCall` and are
+  registered once; the 0.3 lowering reaches them through an adapter, so there is one body, not two. They are keyed by the
+  address of the native function, for external callees as for intrinsic ones. `MLIRThreadState` keeps the `MLIRContext`
+  (without a thread pool, `mlir.enableMultithreading` now defaults to false) and the `TargetMachine`s of a thread, the host is
+  detected once; the MLIR pass pipeline verifies once, after the lowering (`NAUTILUS_IR_VERIFY=1` verifies after every pass).
+  `NirExtensionHooks` is the hook for extension types and operations (M6.5). The corpus runs on `mlir` (`nir-run-mlir-*`; nir-run
+  calls a natively unwinding executable through a typed function pointer, because dyncall's kernel has no unwind info);
+  the mutation check fails exactly `division`, `shifts` and `casts`. The LLVM IR tests no longer pin the 0.3 pipeline and their
+  reference IR is regenerated, in a commit of its own (saturating casts, masked shifts, cold division checks, the value order
+  of the conversion; `engine.normalizeFunctionNames` gives `runtimeFunc<N>` names in the lowering since the NIR tracer does not
+  normalize); the `inlining` suite passes on NIR.
+  **Not done, and why:** (1) DWARF and the instruction -> line map of the NIR printer (the replacement of `IRLocationPass`), and
+  `DebugInfoExecutionTest` on the NIR text form: `debug`, `perf` and `perf.sample` still select the 0.3 pipeline because the NIR
+  tracer produces no source tags or region tables until the debug producers (M4.9); `MLIRNirBackend` throws for them rather than
+  emit DWARF without lines, and `DebugInfoExecutionTest`, `PerfJitDumpExecutionTest` stay on `MLIRLoweringProvider`. (2) The
+  engine-owned worker pool sized by `engine.tiered.promotionThreads` (M4.7): contexts are per thread and have no pool. LLJIT
+  still builds a `TargetMachine` per module for code generation, as ORC may generate code on any thread at the first call.
+  (3) `MLIRLoweringProvider`, the `IRLocationMap` source and `MLIRCompilationBackend`'s IR path stay for the 0.3 pipeline, like
+  `CPPLoweringProvider`; they go with it. (4) Imported callees (M4.6). (5) Not measured against the 0.3 path on the reference
+  machine: the fixed cost per compile is covered by a test that a second compile on a thread builds no context and no target
+  machine, not by a microsecond figure.
+- **Tests.** Every execution test, plugin test and the fuzzer run each backend on the default pipeline; `legacy-tbc` and
+  `legacy-asmjit` run the fallback. Tests of the 0.3 pass statistics, dumps and tbc lowering options pin
+  `tracing.nirTracer=false`; `CompilationStatisticsTest` has the NIR counterparts. Not ported from M4.2's list:
+  `TracingTest`, `RegionTest`, `NoThrowInferenceIntegrationTest`, `InvokeExceptionExecutionTest`'s trace-level cases,
+  `AliveVariableHashTest`, `tracing/CopyAttribution.*`, `TracingBenchmark`, the playground runner (pinned to the 0.3
+  pipeline) and `tools/vscode-nautilus-ir`: they call the 0.3 API directly, which is still there. `test/data` is not
+  regenerated for the same reason. Not started: the `api-compat` leg change, the corpus gates against the 0.3 baselines
+  (the corpus statistics now count the bridged IR), and the fuzzer's generation of D10/D11 edge cases.
+- **Debug information and perf stay on the 0.3 trace.** `debug`, `perf`, `perf.sample` and `dump.copySites` select the 0.3
+  pipeline: DWARF lines, `region()` scopes and jitdump symbols need its source tags and region tables, which NIR gets with
+  the debug producers (M4.9). This is the one place the default depends on options.
+- **Found on the way.** Both NIR tracers wrote cleanup lists in registration order, although 13 §3.4 says destruction
+  order, so pads destroyed in construction order; fixed in its own commit. The 0.3 backends' `ir.*` options configure
+  the fallback only.
+**Compile-time cost of the direct recorder (#576).** `nautilus-compile-bench` (`-DENABLE_BENCHMARKS=ON`) compiles
+`add`, `fib`, `sum`, `internalCallLoop`, `straight`, `calls`, `loopBody` and chained ifs with `tracing.nirTracer` off and
+on in one binary and reports tracing, conversion (0.3: IR generation plus passes) and backend time per traced operation;
+`nautilus-tracing-corpus function[:N] [reps [mode]]` runs the same kernels under callgrind. First measurement: the NIR
+tracer spent a third of a small trace writing the module out and most of the rest in `malloc` (tables rebuilt for every
+function, a multimap node per constant, use counts nobody reads). After keeping the per-trace tables with the thread,
+the zero-filled tag map, the open-addressing constant pool and the cheaper write-out (callgrind instructions per
+`NirTracer::Trace`): `add` 36.7 K -> 20.3 K, `fib` 62.5 K -> 38.8 K, `sum` 67.8 K -> 43.0 K, `internalCallLoop`
+89.9 K -> 56.7 K, `straight(500)` 7.34 M -> 5.35 M, `calls(500)` 3.13 M -> 2.68 M. Median `tracing.ms` of the NIR tracer is
+now at or below the 0.3 tracer's on every kernel (the earlier 1.2-1.4x on the small ones is gone), 0.12-0.17 us per
+traced operation on linear code. What is left is shared with 0.3: the tag of each operation (a frame walk plus a trie
+descent, about 20 % of a linear trace) and the `val<T>` bookkeeping. Chained `if`s trace in time quadratic in their
+number (every explored path replays the prefix before it, 0.07 / 1.6 / 11.8 ms for 10 / 100 / 300 ifs), on both
+tracers; each `if` in its own `region()` is linear (0.04 / 0.30 / 1.0 ms).
+
+**Where the tag cost goes, and what is left (#576).** Upper bounds, measured by stubbing the cost away on `straight(500)`
+(5.35 M Ir per trace at the time; the stubs are only valid on straight-line code): a free tag (stack walk plus trie
+descent) saves 1.56 M (29 %), of which the walk is about 0.5 M and the descent 0.85 M (six appends of 31 instructions per
+operation); the tag map's inserts and growth 0.83 M (18 % of the time); the `val<T>` reference counts 0.25 M (4.6 %). Done:
+a stack-keyed cache in front of the trie descent (shared with 0.3, same nodes), a tag map that clears in constant time and
+keeps its table across traces, inline `inTracer` / reference counts / static-variable hash, block-wise write-out, a leaner
+replay step. `straight(500)` 5.35 M -> 3.93 M, `calls(500)` 2.67 M -> 2.22 M, `chainedIf(100)` 14.3 M -> 12.3 M; the 0.3
+tracer gains 8-9 % on the same kernels, and is 4 % slower on `distinctSites1024` (every tag misses the new cache).
+Not done, and why: recording tags only at control-flow points does not work, because a merge or loop re-entry can be
+detected at any operation (the first one after the join), so every operation needs its program-point identity when it is
+recorded; the replay already needs no tag (it follows the cursor). What remains in a linear trace is about 870
+instructions per operation: the tag (about 160), the `val<T>` machinery and reference counts (about 150), the tag map
+(about 100) and the write-out (about 250). Chained `if`s stay quadratic.
 
 M2.7 (lazy copies) is an investigation; if it is adopted, it lands as its
 own PR after PR 9.
@@ -631,6 +802,18 @@ README §6 and [02 §8](02-nir.md).
   conventions for this branch).
 - **Done when:** `doc-check` passes and fails on a planted stale path.
 
+**M1.8–M1.11 status (PR 2):** the chunk pool is in (`common/ChunkPool.*`); the corpus check against the baseline holds: the
+IR operation and allocation counts of the corpus are those of `main`, and `calls` and the other cases compile in the same
+time (13.0 ms against 13.1 ms for `calls` 5000 on `tbc`, seven repetitions each). `bc` is removed. The corpus driver is
+`nautilus/test/benchmark/latency-corpus/` with a reporting `latency-corpus` CI job; `tools/baselines/record-0.3.sh` builds
+`main` with it and records the corpus and, from the IR dumps of the execution tests, the inferred `FunctionAttributes` and
+the operation count after 0.3's passes of 305 functions: committed in `nautilus/test/baselines/0.3/`, refreshed by the
+`baselines-0.3` workflow. `test/api-compat/` holds 16 of 0.3's test files, `ExecutionTest.cpp` with three cuts, and the
+examples (each pinned backend recorded in its CMake file). `nebulastream.yml` runs for `nautilus-0.4`, and
+`.github/docker/ci-0.4` with the `ci-image` workflow builds the pinned image. Still open and not code: the reference
+machine (needs an owner, §16) and, once the image is published, naming its digest in the two measurement jobs; the
+callgrind instruction counts that "two runs of the same image are identical" is checked with come from that machine.
+
 **M1 exit:** M1.1–M1.12 (with M1.3a, M1.4a and M1.7a) done; the spec is
 marked final ([13 §11](13-nir-spec.md)).
 
@@ -814,6 +997,23 @@ criteria: [03 §6](03-conversion-and-passes.md).
   returns the right result on `tbc` through `NirChain` (exceptions excepted
   until M3.5); the `conversion.*` keys are reported and unit-tested.
 
+- **Status (PR 4):** built: Braun construction with the loop-aware
+  layout, loop-assigned variable sets (a header reads a variable the loop
+  never assigns from its single entry block, `invariantHeaderReads`), the
+  refold sweep (at most three sweeps over the emitted blocks,
+  `refoldSweeps`/`refoldedInsts`), the dead-value sweep and the
+  `conversion.*` keys (`.ms`, `.instructions`, `.phis`, `.removedPhis`,
+  `.folded`, `.cse`, `.refoldSweeps`, `.refoldedInsts`, `.deadBlocks`,
+  `.deadValues`, `.foldedBranches`, `.loops`; reported when the pipeline
+  builds the NIR, checked in `CompilationStatisticsTest`). Not built:
+  `useCount` during emission (nothing consumes it before M3.8), and the
+  corpus op-count mode of `NirChain`. The fuzzer replay runs the chain as the
+  peers `nir-tbc` and `nir-tbc-jit` (smoke corpus and seeds pass; it found a
+  tracer mapping and a conversion layout bug, both fixed). The execution-test mode exists:
+  the pseudo-backends `nir-tbc` and `nir-tbc-jit` (`tracing.nirChain`: 0.3
+  tracer, `toPreSSA`, conversion, `tbc` on NIR) run every execution test, and
+  all pass.
+
 #### M3.2 Folding and simplification rules · M · deps: M3.1
 - **Builds:** the rules of `ConstantFoldingAndCopyPropagationPass` and
   `AlgebraicSimplificationPass` as builder rules, IEEE-strict (D11: no
@@ -857,6 +1057,13 @@ criteria: [03 §6](03-conversion-and-passes.md).
   store in one arm; a load in a loop header with a store in the body.
 - **Done when:** `.nir` tests for each CSE case pass; the fuzzer is clean
   through the `NirChain` mode (M3.1) with block-local CSE on.
+
+- **Status (PR 4):** extended-basic-block CSE for pure values, loads and
+  calls of readonly-or-pure, `willReturn`, `noUnwind` callees, keyed on a
+  memory epoch that stores and possibly-writing calls renew and that every
+  block with several predecessors starts anew (`.nir` tests for the
+  if/else join and the loop header included). Dominator-scoped CSE is not
+  built; it waits for fuzzing through `NirChain`.
 
 #### M3.5 Landing pads · M · deps: M3.1, M3.6
 - **Builds:** cleanup lists → shared landing pads keyed by ordered

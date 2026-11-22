@@ -1,6 +1,5 @@
 
 if (ENABLE_TRACING)
-    add_subdirectory(bc)
     add_subdirectory(cpp)
     add_subdirectory(mlir)
     add_subdirectory(tbc)
@@ -10,6 +9,9 @@ if (ENABLE_ASMJIT_BACKEND)
     add_subdirectory(asmjit)
 endif ()
 
+# the 0.4 backend interface and runtime helpers (docs/plans/nautilus-0.4/05-backends.md)
+add_subdirectory(nir)
+
 
 add_source_files(nautilus
         CapturedExceptionTransport.cpp
@@ -17,10 +19,10 @@ add_source_files(nautilus
         Executable.cpp
 )
 
-# The interpreting backends (bc, tbc) hand out real C function pointers for their
-# compiled functions through the shared NativeClosure component. Its mechanism is
-# selected once, here, for both of them.
-if (ENABLE_BC_BACKEND OR ENABLE_TBC_BACKEND)
+# The interpreting backend (tbc) hands out real C function pointers for its
+# compiled functions through the NativeClosure component. Its mechanism is
+# selected once, here.
+if (ENABLE_TBC_BACKEND)
     add_source_files(nautilus NativeClosure.cpp)
 
     if (ENABLE_FFI_CLOSURES)

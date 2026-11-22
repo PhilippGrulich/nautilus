@@ -3,9 +3,6 @@
 #ifdef ENABLE_ASMJIT_BACKEND
 #include "nautilus/compiler/backends/asmjit/AsmJitCompilationBackend.hpp"
 #endif
-#ifdef ENABLE_BC_BACKEND
-#include "nautilus/compiler/backends/bc/BCInterpreterBackend.hpp"
-#endif
 #ifdef ENABLE_C_BACKEND
 #include "nautilus/compiler/backends/cpp/CPPCompilationBackend.hpp"
 #endif
@@ -13,6 +10,7 @@
 #include "nautilus/compiler/backends/mlir/MLIRCompilationBackend.hpp"
 #endif
 #ifdef ENABLE_TBC_BACKEND
+#include "nautilus/compiler/backends/nir/NirChainBackend.hpp"
 #include "nautilus/compiler/backends/tbc/TBCBackend.hpp"
 #endif
 #include "nautilus/exceptions/RuntimeException.hpp"
@@ -27,11 +25,9 @@ CompilationBackendRegistry::CompilationBackendRegistry() {
 #ifdef ENABLE_ASMJIT_BACKEND
 	items["asmjit"] = std::make_unique<asmjit::AsmJitCompilationBackend>();
 #endif
-#ifdef ENABLE_BC_BACKEND
-	items["bc"] = std::make_unique<bc::BCInterpreterBackend>();
-#endif
 #ifdef ENABLE_TBC_BACKEND
 	items["tbc"] = std::make_unique<tbc::TBCBackend>();
+	items["nirtbc"] = std::make_unique<nirbackend::NirChainBackend>();
 #endif
 #ifdef ENABLE_C_BACKEND
 	items["cpp"] = std::make_unique<cpp::CPPCompilationBackend>();
@@ -53,6 +49,9 @@ void CompilationBackendRegistry::registerBackend(const std::string& name, std::u
 
 const CompilationBackend* CompilationBackendRegistry::getBackend(const std::string& name) const {
 	if (!items.contains(name)) {
+		if (name == "bc") {
+			throw RuntimeException("The backend 'bc' was removed in 0.4; use 'tbc'");
+		}
 		throw RuntimeException("Backend not available");
 	}
 	return items.at(name).get();
