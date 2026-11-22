@@ -1,6 +1,7 @@
 #include "nautilus/compiler/CompilationPipeline.hpp"
 #include "nautilus/CompilationStatistics.hpp"
 #include "nautilus/Executable.hpp"
+#include "nautilus/common/Deterministic.hpp"
 #include "nautilus/compiler/DumpHandler.hpp"
 #include "nautilus/compiler/backends/CompilationBackend.hpp"
 #include "nautilus/compiler/ir/IRGraph.hpp"
@@ -63,6 +64,11 @@ CompilationPipeline::~CompilationPipeline() = default;
 #if defined(ENABLE_COMPILER) && defined(ENABLE_TRACING)
 
 std::string createCompilationUnitID() {
+	if (common::deterministicMode()) {
+		// the same shape as below, from a counter: no clock, no entropy source, no dependence on when a second ends
+		static std::atomic<uint64_t> counter {0};
+		return fmt::format("1970-01-01_00-00-00.000000000_#{:07X}", counter.fetch_add(1) & 0xFFFFFFF);
+	}
 	// `<local date and time to the clock's precision>_#<7 hex digits>`. Every
 	// compile makes two of these, so neither part may cost much: a
 	// std::random_device opens the system's entropy source each time it is
@@ -209,22 +215,25 @@ void addOptimizationPasses(ir::IRPassManager& passManager, const engine::ModuleO
 
 /// The `tracing.*` statistics of one trace, whichever tracer recorded it.
 void recordTracingStatistics(CompilationStatistics& statistics, const tracing::TracingStatistics& t) {
-	statistics.set("tracing.iterations", static_cast<int64_t>(t.iterations));
-	statistics.set("tracing.replayedOperations", static_cast<int64_t>(t.replayedOperations));
-	statistics.set("tracing.snapshots", static_cast<int64_t>(t.snapshots));
-	statistics.set("tracing.operations", static_cast<int64_t>(t.operations));
-	statistics.set("tracing.pausedOperations", static_cast<int64_t>(t.pausedOperations));
-	statistics.set("tracing.copies", static_cast<int64_t>(t.copies()));
-	statistics.set("tracing.copies.construct", static_cast<int64_t>(t.copiesConstruct));
-	statistics.set("tracing.copies.assign", static_cast<int64_t>(t.copiesAssign));
-	statistics.set("tracing.copies.explicit", static_cast<int64_t>(t.copiesExplicit));
-	statistics.set("tracing.scopes", static_cast<int64_t>(t.scopes));
-	statistics.set("tracing.maxScopeIterations", static_cast<int64_t>(t.maxScopeIterations));
-	statistics.set("tracing.firstRun.ms", t.firstRunMs);
-	statistics.set("tracing.rerun.ms", t.rerunMs);
-	statistics.set("tracing.rerun.follow.ms", t.rerunFollowMs);
-	statistics.set("tracing.rerun.record.ms", t.rerunRecordMs);
-	statistics.set("tracing.rerun.paused.ms", t.rerunPausedMs);
+	// kept as the plain struct and turned into entries when the statistics are read
+	statistics.defer([t](CompilationStatistics& s) {
+		s.set("tracing.iterations", static_cast<int64_t>(t.iterations));
+		s.set("tracing.replayedOperations", static_cast<int64_t>(t.replayedOperations));
+		s.set("tracing.snapshots", static_cast<int64_t>(t.snapshots));
+		s.set("tracing.operations", static_cast<int64_t>(t.operations));
+		s.set("tracing.pausedOperations", static_cast<int64_t>(t.pausedOperations));
+		s.set("tracing.copies", static_cast<int64_t>(t.copies()));
+		s.set("tracing.copies.construct", static_cast<int64_t>(t.copiesConstruct));
+		s.set("tracing.copies.assign", static_cast<int64_t>(t.copiesAssign));
+		s.set("tracing.copies.explicit", static_cast<int64_t>(t.copiesExplicit));
+		s.set("tracing.scopes", static_cast<int64_t>(t.scopes));
+		s.set("tracing.maxScopeIterations", static_cast<int64_t>(t.maxScopeIterations));
+		s.set("tracing.firstRun.ms", t.firstRunMs);
+		s.set("tracing.rerun.ms", t.rerunMs);
+		s.set("tracing.rerun.follow.ms", t.rerunFollowMs);
+		s.set("tracing.rerun.record.ms", t.rerunRecordMs);
+		s.set("tracing.rerun.paused.ms", t.rerunPausedMs);
+	});
 }
 
 /// Throws if `module` does not verify; `what` names the module in the message.
@@ -261,17 +270,19 @@ nir::Module convertToSSA(const nir::Module& pre, const engine::ModuleOptions& mo
 	}
 	if (statistics != nullptr) {
 		statistics->recordTimingMs("conversion.ms", conversionStart);
-		statistics->set("conversion.instructions", static_cast<int64_t>(conversionStats.instructions));
-		statistics->set("conversion.phis", static_cast<int64_t>(conversionStats.phis));
-		statistics->set("conversion.removedPhis", static_cast<int64_t>(conversionStats.removedPhis));
-		statistics->set("conversion.folded", static_cast<int64_t>(conversionStats.folded));
-		statistics->set("conversion.cse", static_cast<int64_t>(conversionStats.cse));
-		statistics->set("conversion.refoldSweeps", static_cast<int64_t>(conversionStats.refoldSweeps));
-		statistics->set("conversion.refoldedInsts", static_cast<int64_t>(conversionStats.refoldedInsts));
-		statistics->set("conversion.deadBlocks", static_cast<int64_t>(conversionStats.deadBlocks));
-		statistics->set("conversion.deadValues", static_cast<int64_t>(conversionStats.deadValues));
-		statistics->set("conversion.foldedBranches", static_cast<int64_t>(conversionStats.foldedBranches));
-		statistics->set("conversion.loops", static_cast<int64_t>(conversionStats.loops));
+		statistics->defer([conversionStats](CompilationStatistics& s) {
+			s.set("conversion.instructions", static_cast<int64_t>(conversionStats.instructions));
+			s.set("conversion.phis", static_cast<int64_t>(conversionStats.phis));
+			s.set("conversion.removedPhis", static_cast<int64_t>(conversionStats.removedPhis));
+			s.set("conversion.folded", static_cast<int64_t>(conversionStats.folded));
+			s.set("conversion.cse", static_cast<int64_t>(conversionStats.cse));
+			s.set("conversion.refoldSweeps", static_cast<int64_t>(conversionStats.refoldSweeps));
+			s.set("conversion.refoldedInsts", static_cast<int64_t>(conversionStats.refoldedInsts));
+			s.set("conversion.deadBlocks", static_cast<int64_t>(conversionStats.deadBlocks));
+			s.set("conversion.deadValues", static_cast<int64_t>(conversionStats.deadValues));
+			s.set("conversion.foldedBranches", static_cast<int64_t>(conversionStats.foldedBranches));
+			s.set("conversion.loops", static_cast<int64_t>(conversionStats.loops));
+		});
 	}
 	if (verify) {
 		verifyOrThrow(ssa, "the SSA NIR converted from the trace", &pre);
@@ -367,7 +378,7 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 	const CompilationUnitID compilationId = createCompilationUnitID();
 	auto dumpHandler = DumpHandler(moduleOptions, compilationId);
 
-	if (statistics != nullptr && !statistics->contains("compilation.unitId")) {
+	if (statistics != nullptr && !statistics->containsDirect("compilation.unitId")) {
 		statistics->set("compilation.unitId", compilationId);
 	}
 
@@ -539,7 +550,7 @@ std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr
 	auto dumpHandler = DumpHandler(moduleOptions, compilationId);
 
 	if (statistics != nullptr) {
-		if (!statistics->contains("compilation.unitId")) {
+		if (!statistics->containsDirect("compilation.unitId")) {
 			statistics->set("compilation.unitId", compilationId);
 		}
 		statistics->set("backend.name", backendName);

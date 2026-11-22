@@ -1,5 +1,6 @@
 #pragma once
 
+#include "nautilus/static.hpp"
 #include "nautilus/tracing/TracingUtil.hpp"
 #include "nautilus/val_concepts.hpp"
 #include <type_traits>
@@ -46,6 +47,19 @@ struct StateResolver {
 	}
 };
 
+/// The type C++ converts a literal operand from: a `static_val<T>` is a value C++ knows, exactly like a literal of
+/// type `T` (it converts through `operator T()`), and any other operand is its own type.
+template <typename T>
+struct literal_raw {
+	using type = T;
+};
+template <typename T>
+struct literal_raw<static_val<T>> {
+	using type = T;
+};
+template <typename T>
+using literal_raw_t = typename literal_raw<std::remove_cvref_t<T>>::type;
+
 } // namespace details
 
 /// Converts fundamental types to val<T> wrappers, or returns val<T> as-is.
@@ -78,6 +92,10 @@ decltype(auto) inline make_value(const Type& value) {
 		return val<Type>(value);
 	} else if constexpr (std::is_enum_v<Type>) {
 		return val<Type>(value);
+	} else if constexpr (!std::is_same_v<details::literal_raw_t<Type>, Type>) {
+		// a static_val<T> is a val<T>, not a val<int>: converting it to int would truncate a wider type
+		using Raw = details::literal_raw_t<Type>;
+		return val<Raw>(static_cast<Raw>(value));
 	} else if constexpr (std::is_convertible_v<Type, int>) {
 		return val<int>(value);
 	}
@@ -96,6 +114,19 @@ decltype(auto) inline cast_value(LeftType&& value) {
 		return std::forward<LeftType>(value);
 	} else {
 		return static_cast<val<commonType>>(value);
+	}
+}
+
+/// Converts val<LeftType> to exactly val<To> if it is not one yet, narrowing included. cast_value only widens (it
+/// converts to the common type of both), which is not what a shift needs for its amount: the amount takes the type of
+/// the shifted value, whatever its own width.
+template <typename LeftType, is_fundamental To>
+decltype(auto) inline convert_value(LeftType&& value) {
+	using basic_type = typename std::remove_reference_t<LeftType>::basic_type;
+	if constexpr (tracing::same_nautilus_type<basic_type, To>::value) {
+		return std::forward<LeftType>(value);
+	} else {
+		return static_cast<val<To>>(value);
 	}
 }
 
