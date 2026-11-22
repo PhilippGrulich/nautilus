@@ -291,7 +291,7 @@ changes M4.2 and §2 step 2 as follows:
   counters are the 0.3 ones; D10/D11 are explicit (cold block for checked `div`/`rem`, masked narrow shifts, saturating
   casts); the plugins' intrinsic handlers take an `IntrinsicCallContext` and serve both lowerings. See the notes of
   `backends/AGENTS.md`. Deferred: the 0.3 providers stay for `legacy-asmjit` until M4.2; the line table of 05 §4.4
-  step 3 and `perf`/`debug` come with M4.9; the callgrind ratio gate is the `callgrind-gate` leg (it has the backend ratios on `tbc` and `asmjit`; the `asm-diff` leg
+  step 3 and `perf`/`debug` came with M4.8; the callgrind ratio gate is the `callgrind-gate` leg (it has the backend ratios on `tbc` and `asmjit`; the `asm-diff` leg
   compares code size against the recorded 0.3 corpus).
 - **M4.5 (`mlir` on NIR) is done in PR 8**, stacked on PR 7, by the same method (the loop: autoresearch, metric = failing assertions
   and crashed tests of `ctest --preset full`): 1582 for the scaffold that throws (1579 failed assertions, 3 crashed), 9 with the
@@ -311,13 +311,11 @@ changes M4.2 and §2 step 2 as follows:
   of the conversion; `engine.normalizeFunctionNames` gives `runtimeFunc<N>` names in the lowering since the NIR tracer does not
   normalize); the `inlining` suite passes on NIR.
   **Not done, and why:** (1) DWARF and the instruction -> line map of the NIR printer (the replacement of `IRLocationPass`), and
-  `DebugInfoExecutionTest` on the NIR text form: `debug`, `perf` and `perf.sample` still select the 0.3 pipeline because the NIR
-  tracer produces no source tags or region tables until the debug producers (M4.9); `MLIRNirBackend` throws for them rather than
-  emit DWARF without lines, and `DebugInfoExecutionTest`, `PerfJitDumpExecutionTest` stay on `MLIRLoweringProvider`. (2) The
+  `DebugInfoExecutionTest` on the NIR text form: done in M4.8 (below). (2) The
   engine-owned worker pool sized by `engine.tiered.promotionThreads` (M4.7): contexts are per thread and have no pool. LLJIT
   still builds a `TargetMachine` per module for code generation, as ORC may generate code on any thread at the first call.
   (3) `MLIRLoweringProvider`, the `IRLocationMap` source and `MLIRCompilationBackend`'s IR path stay for the 0.3 pipeline, like
-  `CPPLoweringProvider`; they go with it. (4) Imported callees (M4.6). (5) Not measured against the 0.3 path on the reference
+  `CPPLoweringProvider`; they go with it. (4) Imported callees (done in M4.6). (5) Not measured against the 0.3 path on the reference
   machine: the fixed cost per compile is covered by a test that a second compile on a thread builds no context and no target
   machine, not by a microsecond figure.
 - **Tests.** Every execution test, plugin test and the fuzzer run each backend on the default pipeline; `legacy-tbc` and
@@ -328,9 +326,8 @@ changes M4.2 and §2 step 2 as follows:
   pipeline) and `tools/vscode-nautilus-ir`: they call the 0.3 API directly, which is still there. `test/data` is not
   regenerated for the same reason. Not started: the `api-compat` leg change, the corpus gates against the 0.3 baselines
   (the corpus statistics now count the bridged IR), and the fuzzer's generation of D10/D11 edge cases.
-- **Debug information and perf stay on the 0.3 trace.** `debug`, `perf`, `perf.sample` and `dump.copySites` select the 0.3
-  pipeline: DWARF lines, `region()` scopes and jitdump symbols need its source tags and region tables, which NIR gets with
-  the debug producers (M4.9). This is the one place the default depends on options.
+- **Debug information and perf** ran on the 0.3 trace until M4.8, which gave NIR its debug producers; only `dump.copySites`
+  still selects the 0.3 pipeline, and it is the one place the default depends on options.
 - **Found on the way.** Both NIR tracers wrote cleanup lists in registration order, although 13 §3.4 says destruction
   order, so pads destroyed in construction order; fixed in its own commit. The 0.3 backends' `ir.*` options configure
   the fallback only.
@@ -365,6 +362,45 @@ instructions per operation: the tag (about 160), the `val<T>` machinery and refe
 
 M2.7 (lazy copies) is an investigation; if it is adopted, it lands as its
 own PR after PR 9.
+
+**PR 9 status (M2.2–M2.6, M2.8; M2.7 not done).** Built on the direct tracer of #576 and the cut-over:
+
+- **M2.2.** R3: a paused scope publishes a thread-local flag (`detail::pausedFast`) and the `val` holders return on it
+  (checked on the slow path, so the common case pays nothing). R2: a region in a replay is found by the entry block that
+  the recorded path enters (`FlatTrace::seekBlock`, memo keyed by block id), without a snapshot. R4: `tracing.unwindPausedPasses`
+  (a private `PausedPass` exception caught in `runScope`, the swallowed case detected after the body returns and counted as
+  `tracing.unwindFallbacks`). **The R4 default stays off**, for three reasons. The data the plan asks for (NebulaStream, TPC-H)
+  is not available to this PR. A `noexcept` frame or a destructor between the traced code and its scope would terminate the
+  process. And the fuzzer, given a peer with R4 on, found at once that the skipped C++ tail includes host-side bookkeeping:
+  the loop-frame stacks of its evaluator were left behind, so a value outlived its construct (`NAUT-T004`); R4 is only for traced
+  code without such state, so it has no fuzzer peer. Measured on `chainedIf/100` (`tbc`, dev build, 3 repetitions): without
+  R4 101 passes, 30100 replayed and 14751 paused operations, re-run share 0.91, tracing 0.72 ms; with R4
+  `tracing.pausedOperations` is 0 (99 unwound passes) but tracing takes 1.01 ms, because a throw (about 3.5 µs) costs more
+  than the paused tail it saves (0.10 ms of the re-run time in all). On this corpus R4 does not pay; whether it does on
+  TPC-H or NebulaStream is the open question the `tracing.rerun.share` key and `tools/tpch/summarize.py` can answer.
+- **M2.3.** The std plugin takes `const val<T>&` (1115 parameters). On the std plugin's own tests the recorded copies fall
+  from 4840 to 2504 (-48%), the recorded operations by 9%. `tools/tpch` (`run-tpch.sh`, `summarize.py`), the
+  `tpch-duck` workflow and the TPC-H step of `baselines-0.3` implement the job and the 0.3 baseline; **none of it has run**,
+  because nautilus-duck is an external repository that the session that wrote this had no access to. The jobs are skipped
+  until the repository variable `TPCH_DUCK_ENABLED` is `true`; the commands that build and run nautilus-duck are variables of
+  `run-tpch.sh` to confirm with its owner. The "a quarter below the 0.3 baseline on TPC-H" criterion is therefore open.
+- **M2.4.** `NAUT-T001`…`T005` (constant loop, path explosion, replay share, value escaping a region or construct, invalid
+  exit), `engine.diagnostics`, `docs/diagnostics.md`, the `debug-trace` skill. The plan's "state differs at the end" check of a
+  region is folded into `T004`: with `val`s alive at the end already rejected, only a `static_val` that outlives its
+  scope could trigger a separate code, and a region's scope sees none of the outer ones.
+- **M2.5.** As in 01 §5: construct scopes are memoized by entry block, optimistic, restarted after `FlatTrace::rollback`;
+  one difference: the table-by-table truncation of the plan lists the callee queue, data objects and `extra`; those stay
+  (nothing refers to them after the restart, and the canonical form drops what is unused). Tests:
+  `ExplicitControlFlowTest.cpp`, `NirTracerFrontendTest.cpp`; the corpus twins `chainedIfExplicit` and `loopBodyExplicit`; the fuzzer
+  writes If/Loop/While nodes explicitly for none, all or the odd nodes of a program, with a `force-construct-restarts` peer.
+  Callgrind, pinned image: tracing the explicit `chainedIf/300` takes 3.48 M instructions against 153 M for 0.3's implicit one
+  (2.3%), and the whole compile on `tbc` 4.1%; `loopBodyExplicit/10000` compiles in 11% of 0.3's instructions. The other
+  cases stay inside their ratchets: the per-record cost of the frontend work was brought back to the level of the M4.8
+  branch (the undo log of the tag map is gone; a rollback erases the entries of the dropped records by walking the table).
+  On the explicit `chainedIf` every size traces in `1 + 2·N` passes (the function, two arms per `if`), zero replayed and
+  zero paused operations.
+- **M2.6.** `nautilus/data.hpp`; the conversion folds loads at constant offsets from `data.addr`. Persistability is M5.3.
+- **M2.7.** Not started.
 
 **Before the cut-over,** PRs 1–5 and 7 can land: they add code the engine
 does not call yet (PR 7's backends are switched on by PR 6). After PR 2,
@@ -1119,6 +1155,42 @@ criteria: [03 §6](03-conversion-and-passes.md).
 - **Done when:** `.nir` tests per pass; fuzzer clean with every optional
   pass enabled.
 
+- **Status (PR 10).** Built, in `passes/` (part of `nautilus-nir`, see its `AGENTS.md`): the copy-pass interface and
+  `PassManager` (groups run as fixed points up to `ir.maxPipelineIterations`, a `PipelineReport` per run), a mutable
+  per-function form (`MutableFunction`: stable uids, `encode` writes dense ids, pads last in order of first reference,
+  unreachable blocks dropped), a CFG with dominators and natural loops, and the three passes. **LICM** hoists
+  instructions without effect that cannot throw and read no memory (pure core and extension operations, unchecked
+  `div`/`rem`, calls with all six guarantee bits and `NO_UNWIND`) into the preheader, innermost loop first, making a
+  preheader block where the loop is entered through a branch or from several places; loads and stores stay (no alias
+  analysis). **Strength reduction** turns `base + iv * stride` into a loop-carried pointer for a 64-bit `iv` that the
+  one back edge steps by a constant (narrower than 0.3's: a 32-bit index would need a proof that it does not wrap).
+  **Inlining** replaces calls of non-recursive internal callees without function string attributes and at most
+  `ir.inline.maxInsts` instructions, callees first (Tarjan order), merging a single-block callee into the caller's block,
+  joining several returns in a block argument, copying alloca slots, continuing `resume` of a callee pad in the caller's
+  pad, and removing the internal functions nothing refers to afterwards (not when the module has debug regions). The
+  options: `ir.inline`, `ir.inline.maxInsts`, `ir.inline.crossModule`, `ir.enableLICM`, `ir.enableStrengthReduction`,
+  `ir.maxPipelineIterations`; `ir.runPasses` and `ir.runOptimizationPasses` pin them (03 §5, `docs/options.md`). The
+  options of the 0.3 passes the conversion replaced (`ir.disableConstantFolding` ... `ir.enableLocalCSE`) are accepted
+  and warn once. The passes run per compile in `CompilationPipeline::compileIR`, on a copy of the graph's module: the
+  tier-0 compile of a promoted module is latency-critical and skips them unless `ir.runOptimizationPasses` is true, tier
+  1 runs them. Statistics: `irPasses.<pass>.ms/.runs/.changes` (`inline`, `licm`, `strengthReduction`, plugin passes by
+  name), `irPasses.pipelineIterations`, `irPasses.totalMs`, `irPasses.inline.decisions` and `.importedModules`;
+  `explain()` shows them as `inlining`. The default compile does no work for any of it: one `hasIrOptions()` test and
+  two atomic loads. Tests: `PassTest.cpp` (every pass, the pass manager, the options), `data/nir-run/passes.nir` and
+  the nested pad case in `exceptions.nir`, and every `nir-run` file again with all passes on (`nir-run-tbc-optional-*`,
+  `nir-run-asmjit-optional-*`), `OptionalPassesTest.cpp` (statistics, engine, `explain()`).
+  **Cross-module inlining (from M4.6)** is built: an imported callee whose exporter is known (the registry's NIR, the
+  hash recorded at the link) has its body, with the internal functions of its module that it reaches, copied into the
+  importer as internal functions (`Transplant`), the call is retargeted and the ordinary inlining decides. A closure that
+  uses `bind.addr`, an extension operation, a function string attribute or an import of its own is not copied, nor one
+  above `4 * ir.inline.maxInsts` instructions; the reason is in `irPasses.inline.decisions`. The exporter hash of every
+  copied import is in `irPasses.inline.importedModules` (the key of 13 §7.3 is `nir::keyWithInlinedImports`; the caches
+  of M5 use it). **Not done, and why:** (1) the fuzzer harness has no mode that turns the optional passes on; the
+  `nir-run` corpus and the engine tests stand in until M2's fuzzer work (the replay driver reads `NAUTILUS_OPTIONS`, so
+  `ir.inline=true;ir.enableLICM=true;ir.enableStrengthReduction=true` runs it with every pass on); (2) loads are not
+  hoisted; (3) a copied exporter body keeps no debug locations; (4) a promoted exporter is not seen by an importer that
+  inlined it (13 §4.4.3: the name refers to one module while the importer is linked).
+
 #### M3.9 Plugin pass hooks · S · deps: M3.7
 - **Builds:** `afterConversion` and `beforeLowering` with required/optional
   marking ([03 §5](03-conversion-and-passes.md)).
@@ -1126,6 +1198,19 @@ criteria: [03 §6](03-conversion-and-passes.md).
   any engine is constructed (the registry freezes then, M1.7).
 - **Done when:** a test plugin's required pass runs on latency-critical
   compiles and its optional pass does not.
+
+- **Status (PR 10).** Built: `ExtensionRegistry::registerPass(PassInfo)` (`extensions/PassInfo.hpp`: a name
+  `<plugin>.<name>`, `PassPoint::AfterConversion` or `BeforeLowering`, `PassRequirement::Required` or `Optional`, a
+  function `optional<Module>(const Module&, const PassEnvironment&)` that gets the options and, before lowering, the
+  backend), `passesAt`, `hasPassesAt` (an atomic counter: a build without plugin passes pays one load), and the freeze at
+  `NautilusEngine` construction, which M1.7 specified and the engine had not done. Required `afterConversion` passes run
+  once per module in `traceToNir`, before the link; all others per compile in `compileIR` with the core optional passes
+  (optional `afterConversion`, core, then `beforeLowering` in registration order), so tier 1 runs what the
+  latency-critical tier 0 skipped; legalization does not exist as a pass yet, so `beforeLowering` is the point right
+  before the backend. Tests: `nautilus/test/pass-tests/PluginPassTest.cpp`, a binary of its own with a plugin that
+  registers four passes from a static initializer and rewrites constants so that the test sees which module the
+  backend got: required passes run on the tier-0 compile of a two-tier module, optional ones only on tier 1 (or with
+  `ir.runOptimizationPasses=true`), neither optional kind with it `false`, required ones always.
 
 #### M3.10 M3 gate · S · deps: M3.2–M3.6
 - **Builds:** the op-count report against the 0.3 baseline in the corpus
@@ -1136,6 +1221,16 @@ criteria: [03 §6](03-conversion-and-passes.md).
   and, once the `tpch-duck` job exists, on TPC-H kernels; no IR pass runs
   on a default compile (`irPasses.pipelineIterations` = 0, checked
   exactly).
+
+- **Status (PR 10).** Built: the corpus output has `nir_ops` (NIR instructions after the conversion), `refold_sweeps`,
+  `refolded_insts` and `pipeline_iterations` per case, and a case `loopInvariantReassign` (a variable assigned the value
+  it holds, inside the loop, N times); `tools/latency/opcount-report.py` compares `nir_ops` with the recorded 0.3
+  `ir_ops` and fails on more operations or on a pass on a default compile; the `latency-corpus` job runs it. The
+  compile-fail suite (`nautilus/test/compile-fail/`: each file names the message it must produce; the primary
+  `val<T>` now says what is wrong) and `OptionalPassesTest.cpp` (`irPasses.pipelineIterations` is exactly 0 on every
+  built backend). The callgrind gate's thresholds are unchanged. **Not done:** the TPC-H kernels (no `tpch-duck` job
+  yet) and the µs/op numbers on the reference machine; the PR description states what the instruction-count gate
+  allows, not measured reference-machine times.
 
 ## 10. M4 Backends, the cut-over, tiering
 
@@ -1285,6 +1380,39 @@ checked at M4.2.
 - **Done when:** cycles, signature and guarantee mismatches are rejected;
   an exporter's promotion is seen by importers; release order holds; every
   backend runs cross-module calls.
+- **As built.** `link::ModuleRegistry` (one per engine; `NautilusEngine::moduleRegistry()`) holds a `ModuleHandle` per
+  named module with the stages built → linked → compiled → released; `ModuleHandle::link` resolves, checks (exact
+  signature with extension kinds, `attrsImply`, cycle through the recorded import edges, exporter compiled) and binds
+  atomically; `link::ImportSlots` are the cells (release store, acquire load) and `link::ImportLink` owns them with the
+  pins on the exporters and the executables a slot has named (a running call may still be in the old code). The handle
+  is owned by `ModuleState::link`, so release order is ownership order: an importer pins its exporters, an exporter's
+  name stays registered while any importer lives. Promotion is seen through `ModuleState::version`: its `fetch_add` (the
+  one point every install of an executable passes, `CompiledModule::setExecutable` and the tier-1 promotion alike) calls
+  the observers the registry adds, which republish the slots of the importers. Host API: `createModule(name)`,
+  `NautilusModule::importFunction<Signature>(module, function[, assumed])` (early signature check, assumed attributes
+  copied from the export), `setFunctionAttributes` (declared guarantees of an export), `link::LinkError`. A named module
+  or one with imports compiles inside a `LinkSession`, which the pipeline reaches through the thread
+  (`LinkSession::current()`) after conversion: the module gets its name, its imports are linked, and the graph carries
+  the `ImportLink` to the backends (`HostEnvironment::imports`, tier 0 and promotion alike).
+  **Backends.** An imported call loads the slot (acquire on AArch64, a plain load where the target orders it) and calls
+  the entry point with the C convention of the signature: `tbc` (`LOAD` + `CALL_IND`), `asmjit` (x86-64 and AArch64),
+  `cpp` (`__atomic_load_n`) and `mlir` (an `llvm.load atomic acquire` and an indirect call). The exporter's exception
+  mode is that of its current tier and changes with a promotion, so a call that may throw goes through a typed thunk the
+  C++ front end registers per import (`ImportSlots::captureThunk`: `captureThrowingCall` for the backends that capture;
+  `frameThunk`: `callInExceptionFrame` for MLIR, which pushes an exception frame for a capturing exporter and rethrows
+  from it). An import without thunks (a hand-written module) is called directly, which is right when exporter and
+  importer have the same mode.
+  **Not done, and why:** (1) Cross-module inlining was not built here; it is done in M3.8 (PR 10). It is a mode of the
+  inlining pass of M3.8, which did not exist on this branch; the registry keeps what it needs (the exporter's SSA module, `ModuleHandle::module()`, and its structural
+  hash, recorded in `ImportLink::bindings` at the link, for the key of compiled code that inlines, 13 §7.3), but there is
+  no pass to inline with, and so no use for the rule that functions with `bind.addr` stay out. (2) `funcaddr` of an
+  imported function (the stub that calls through the slot): no front end takes such an address, and every backend
+  throws `NotImplementedException` for it. (3) The C API and loaded images link with the same registry, but have no
+  entry point yet (M5). (4) The exporter's structural hash is taken with the default options. (5) Imports need the NIR
+  pipeline: `tracing.nirTracer=false`, `debug` and `perf` throw at the call, and the bridge to the 0.3 IR (`NirToIR`)
+  rejects imported callees. (6) The exporter's attributes are the declared ones: the conversion infers the guarantees of
+  internal functions only, so an exported function guarantees nothing unless `setFunctionAttributes` says so. (7) The
+  `mlir` lowering could not be built in the session that wrote it (no MLIR in the `dev` preset); CI is its test.
 
 #### M4.7 Promotion service · L · deps: M4.5
 - **Builds:** [11 §4](11-tiered-compilation.md): engine-wide worker pool,
@@ -1303,6 +1431,19 @@ checked at M4.2.
 - **Done when:** the tests of [11 §6](11-tiered-compilation.md), except
   its Caches bullet (checked by M5.7), pass, including fault injection,
   the fuzzer with forced promotion and the thread bound with MLIR workers.
+- **Status.** Built: `PromotionService` (fixed worker pool, lazy start, `nice`/QoS background priority, admission
+  cap, `PromotionJob` states, cancellation through the token the backends already poll, shutdown that holds no mutex
+  while it joins or waits), the status API on `CompiledModule`/`CompiledFunction` and `NautilusEngine::waitForPromotions`
+  (`JITCompiler::waitForPromotions` underneath), policies `eager` and `manual`, early start with the late tier 0
+  dropped, the tier options settable alone and checked at engine construction, the promotion through
+  `CompilationPipeline::compileIR` with the unit ID `<tier 0>_tier1`. `TieredJITCompiler::waitForPendingPromotions`
+  and `retainedPromotionThreads` are gone. Workers disable `mlir.enableMultithreading` in their copy of the
+  options instead of sharing an `llvm::ThreadPool`: contexts are per thread and have no pool (M4.5).
+  **Not done, and why:** (1) the Caches bullet of 11 §6 and the L0 "one job per entry" rule (M5.7); (2) early start
+  is limited to a tier pair that both compile NIR (`canStartEarly`), because a backend that needs the 0.3 IR builds
+  it into the shared graph; the 0.3 pipeline and the GPU backends start after tier 0, as before; (3) `promotion.status`
+  and `promotion.error` of a failed promotion go to the tier-1 report that is logged and appended to
+  `NAUTILUS_STATISTICS_FILE`, not to the statistics of the module (the tier-0 report is immutable and shared).
 
 #### M4.8 Debug info and profiling (D14) · M · deps: M4.4, M4.5
 - **Builds:** `asmjit` symbols per function (and per region with source
@@ -1313,6 +1454,43 @@ checked at M4.2.
   pass; a `perf.sample` test passes on `asmjit`, including per-operation
   attribution through `JitSymbolRegistry::resolveLine`; the `profiling`
   plugin suite passes.
+- **Status (stacked on #594).** Built:
+  - *Producers.* With `debug`, `perf` or `perf.sample` the NIR tracer writes the debug sections of 13 §4.9
+    (`SessionState::emitDebugData`): the region table (name, call-site location, parent) from the regions the flat trace
+    already kept, the location of each function, and `debugInstRegions` from a per-record region (`FlatTrace::recRegion`,
+    kept only on request); the conversion carries the region of every instruction it emits (`bodySrc_`, the pre-SSA
+    instruction each temporary came from). `debugInstLocations` is `NONE`: the C++ location of each operation is not
+    recorded (0.3 never put it in DWARF; the lines are those of the NIR text). The pipeline no longer selects the 0.3 trace
+    for these options. Off, a trace pays a branch per function and the conversion one flag.
+  - *The printer's side output.* `nir::print(module, PrintLines&)` returns the text and the line of every instruction, block
+    and function: the replacement of `IRLocationPass` (03 §2.1). `Module::internDebugName/internDebugLocation/regionOf`.
+  - *`mlir`.* `MLIRNirBackend` writes the text where 0.3 wrote its IR dump (`backends/DebugSource.hpp`, shared with
+    `asmjit`), `MLIRNirLowering` gives every operation a `FileLineColLoc` in it (named `$<instruction>`, fused with the
+    region chain of `RegionScopeInfo`), the function header line, the shadow slot of every value under `debug`; the passes
+    of `mlir/debug/` and the jitdump and registry plugins are the 0.3 ones. It no longer throws for these options, and the
+    JIT is given the same flags as in 0.3 (codegen level under `debug`, jitdump, registry).
+  - *`asmjit` and `tbc.mode=jit`.* `asmjit` marks the code of each NIR instruction with a comment node (a `[Nautilus]` patch
+    of `BaseBuilder::serializeTo` reports its buffer offset; the node survives allocation and the peephole pass);
+    `tbc` records the NIR instruction of each bytecode word and the stitcher the offset of each stitched instruction.
+    `publishNirCode` (`backends/NirCodeProfile.cpp`) turns that into a symbol per function and per `region()` run in
+    `JitSymbolRegistry` (`execute::outer::hot`, as `mlir` names them), the line table `resolveLine` serves (the lines of the
+    printed module, written to the working directory), and, for `perf`, jitdump records written by `PerfJitDump` (the
+    format of the LLVM writer, its own file). The executables withdraw their symbols when they are destroyed.
+  - *Tests.* `DebugInfoExecutionTest` and `PerfJitDumpExecutionTest` run on the NIR pipeline (the expectations that named the
+    0.3 text, `nautilus {` and `Block_`, name the NIR text now); `ProfilingSymbolsTest` (symbols per function and region
+    on `asmjit` and the stitched `tbc`, per-operation attribution through `resolveLine` by what the lines of the two regions
+    do, withdrawal, nothing published unasked, tier 0 of the default engine, the jitdump pairing of debug-info and load
+    records); `SamplerTest` of the `profiling` plugin runs on `mlir` and `asmjit` (it is built without MLIR now); two
+    tracer tests on the debug sections (`NirTracerTest.cpp`). The `profiling` plugin suite was already a step of `pr.yml`.
+  **Not done, and why:** (1) the C++ source location of each operation (`debugInstLocations`, the "source tag" of 02 §3.2):
+  it needs the tag of every record resolved through DWARF, which no consumer reads yet; (2) `tbc` in interpreter mode
+  publishes nothing: its handlers are host code that the ELF symbols name, and a handler is shared by every instruction,
+  so an address says nothing about the NIR instruction (a per-handler range would be the host's own symbol size); (3)
+  the text form of NIR has no `loc`/`region` suffixes (the grammar of 13 §9 has them, the printer and parser do not), so
+  a module with debug sections prints without them and an image round trip is the way to keep them; (4) `debug` on
+  `asmjit` or `tbc` still records the sections and does nothing with them (no debugger interface for generated code
+  other than LLVM's); (5) `perf` jitdump files of `asmjit` and `mlir` are two files with the same pid in one process, which
+  `perf inject --jit` reads one after the other; not tried against a real `perf` here (no PMU in the session).
 
 #### M4.9 Agent items for M4 · M · deps: M4.7, M3.8
 - **Builds:** `CompiledModule::explain()` (also as JSON; fields for
@@ -1321,6 +1499,24 @@ checked at M4.2.
   ([15 §5](15-agent-experience.md)).
 - **Done when:** `explain()` is covered by a test; `affected-tests` maps a
   sample of changed files to the expected targets.
+- **Status.** Built: `CompiledModule::explain()` returning a `ModuleExplanation` (`include/nautilus/ModuleExplanation.hpp`,
+  `link/ModuleExplain.cpp`) with `toString()` and `toJson()`: the module's name and registry stage, the tier that runs
+  it and its backend, the two tiers with their backends and status (`active`, `replaced`, or the promotion state; the
+  backends come from `PromotionControl::tierBackends()`, which the compiler fills from the configuration it already
+  holds), the promotion status and error, the imported modules, per function its tier, backend, block and instruction
+  counts, guarantees and whether it is exported (from the module's NIR as the registry keeps it), and the statistics of
+  the running executable. `persistability` (M5.3) and `inlining` (M3.8) are present as `{"available": false,
+  "status": "not available yet", "milestone": ...}` and become data when those land. `explain()` only reads recorded
+  state: nothing was added to the compile path except two backend-name strings copied into the promotion's control.
+  `tools/agent/affected-tests` (files or `--base REF` to targets; `--json`, `--preset`), with its own `--self-test`
+  (every target of a rule is defined by CMake, a sample of files maps to the expected targets, the git path) that the
+  `doc-check` job runs; the `memory-check` skill (arena counters, the 40,000-module probe, ASan/LSan). Tests:
+  `ModuleExplainTest.cpp` (single tier, JSON, manual promotion before and after, interpreted).
+  **Not done, and why:** (1) the IR at each stage "on request" of [15 §4.3](15-agent-experience.md): it needs the
+  dump hooks to hand out their text, which M4.10 or a later item can add on top of this report; (2) per-function
+  tier and backend are those of the module, because one executable holds every function; (3) `functions` is empty
+  for a module without NIR (the 0.3 pipeline), and says so (`functionsAvailable`); (4) why a call was not inlined and
+  `artifact.ineligibleReason` wait for M3.8 and M5.3 as the task says.
 
 #### M4.10 M4 exit · S · deps: M4.3–M4.9
 - **Builds:** every backend switched on except GPU (M7,

@@ -318,6 +318,8 @@ jobs:
         run: python3 tools/doc-check/doc-check.py --self-test
       - name: doc-check
         run: python3 tools/doc-check/doc-check.py
+      - name: affected-tests maps a sample of changed files to the expected targets
+        run: python3 tools/agent/affected-tests --self-test
   nir-components:
     runs-on: ubuntu-24.04
     if: ${{ github.event.action != 'labeled' || github.event.label.name == '0.4' }}
@@ -398,6 +400,10 @@ jobs:
         run: |
           ./build/nautilus/test/benchmark/nautilus-latency-corpus 3 > corpus.jsonl
           wc -l corpus.jsonl
+      - name: op counts against the recorded 0.3 baseline (M3 gate)
+        shell: bash
+        run: |
+          python3 tools/latency/opcount-report.py corpus.jsonl --baseline nautilus/test/baselines/0.3/corpus.jsonl --markdown "$GITHUB_STEP_SUMMARY"
       - name: upload the results
         uses: actions/upload-artifact@v4
         with:

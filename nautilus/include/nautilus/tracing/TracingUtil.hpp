@@ -35,12 +35,16 @@ inline void setActiveTracer(TracingInterface* tracer) {
 	detail::activeTracer = tracer;
 	// the new tracer publishes the reference counts of its scope itself (publishAliveVariables)
 	detail::aliveFast = nullptr;
+	detail::pausedFast = false;
 }
 
 /// Lets the reference counts of values be updated inline: @p alive is the hash of the active tracer's current scope, or
-/// null if that scope must see every update (it is paused).
-inline void publishAliveVariables(AliveVariableHash* alive) {
+/// null if that scope must see every update. @p paused tells the holders that the scope runs a finished pass, whose
+/// reference counts nobody reads: they skip the update altogether (a tracer that does this must also ignore
+/// `allocateValRef`/`freeValRef` while paused).
+inline void publishAliveVariables(AliveVariableHash* alive, bool paused = false) {
 	detail::aliveFast = alive;
+	detail::pausedFast = paused;
 }
 
 /// Whether the val<T> layer folds operations over values C++ already knows while tracing, e.g. the byte offset of
@@ -100,6 +104,11 @@ TypedValueRef& traceCall(void* fptn, Type resultType, const std::vector<tracing:
 TypedValueRef& traceCallWithExceptionHandling(void* fptn, Type resultType,
                                               const std::vector<tracing::TypedValueRef>& arguments,
                                               FunctionAttributes fnAttrs, void* captureFunc = nullptr);
+
+/// A call to an exported function of another module through its import slot (13-nir-spec.md §4.4); see
+/// TracingInterface::traceImportedCall.
+TypedValueRef& traceImportedCall(std::string_view moduleName, std::string_view functionName, Type resultType,
+                                 const std::vector<tracing::TypedValueRef>& arguments, FunctionAttributes fnAttrs);
 
 void registerDestructor(const TypedValueRef& address, void* destructor);
 void unregisterDestructor(const TypedValueRef& address);
