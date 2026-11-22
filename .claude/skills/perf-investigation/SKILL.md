@@ -31,6 +31,10 @@ The ready-made harness (`-DENABLE_BENCHMARKS=ON`) is `nautilus-compile-bench [re
 (`nautilus/test/benchmark/CompileTimeBench.cpp`): per kernel and size, tracing, conversion (or IR generation plus
 passes) and backend time and microseconds per traced operation, for the 0.3 pipeline and the NIR tracer on one binary.
 `nautilus-tracing-corpus function[:N] [reps [nir]]` runs the tracer alone for callgrind; the same kernels.
+`nautilus-fixed-cost-bench [reps [kernel [backend]]]` is the harness for the cost that does not grow with the function:
+one engine, one tiny kernel registered over and over, the median wall time of `registerFunction` next to every duration
+statistic and the time no stage accounts for (`FIXED_COST_CALL=1` adds the first call). Compare two builds by running
+their binaries alternately, and use callgrind (`NautilusModule::compile()` inclusive) for the numbers to quote.
 
 ## 3. A probe for one function shape
 
@@ -60,6 +64,25 @@ callgrind_annotate --inclusive=yes /tmp/cg.out | head -40
 - Compare the total and the top inclusive functions before and after.
 - A cost that grows faster than the input (2x input → 4x cost) is a
   superlinear path; find the loop in the top function (#565 was one).
+
+## 4b. The instruction-count gate
+
+CI gates the compile cost of the latency corpus as callgrind instruction counts against `main`'s
+(`callgrind-gate` job, `nautilus/test/baselines/callgrind-gates.json`, plan `10-observability.md` §2.1). To run it
+yourself, with valgrind and Clang installed (no container; about 15 minutes cold, a minute with a warm ccache):
+
+```bash
+tools/latency/run-callgrind-local.sh --out /tmp/cg-gate               # builds main's driver and yours, measures, compares
+tools/latency/run-callgrind-local.sh --out /tmp/cg-gate --update      # after an intended change: lowers the thresholds
+python3 tools/latency/callgrind-gate.py --self-test
+```
+
+The table lists, per case and metric (`total`, `tracing`, `ir` = conversion and passes, `backend`), the counts, the
+ratio against 0.3, the threshold that fails and the plan's target that warns. Outside the pinned image the library
+counts differ from the recorded ones, so a local run warns about the fingerprint and only the ratios are meaningful;
+`--update` belongs to the image (use the counts the CI job uploads: `callgrind-gate.py update --ref 0.3.tsv --new
+nir.tsv`). A real regression is fixed or, rarely, accepted with `--allow-raise` and a reason in the PR. One case:
+`tools/latency/callgrind-corpus.sh -c 'straight 1000 tbc' <driver> out.tsv`.
 
 ## 5. Compare generated code
 

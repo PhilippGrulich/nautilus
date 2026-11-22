@@ -300,19 +300,29 @@ constexpr T wrappingMul(T a, T b) {
 #define NAUTILUS_EVAL_SHR(a, b) ((a) >> (b))
 #define NAUTILUS_EVAL_SHL(a, b) ((a) << (b))
 
-/// Binary operator helper for arithmetic operations with integer promotion
-#define DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(OP, OP_NAME, OP_TRACE, EVAL)                                      \
+/// The type a shift converts its operands to: the promoted type of the shifted (left) operand. The type of `a << b` is
+/// the promoted type of `a` alone, so a wider amount must not widen the shift: a shift recorded with the type of its
+/// amount is a shift at the wrong width, and does not wrap where the shifted value does. The amount takes the type of
+/// the shifted value too, where it is masked (an amount of 2^32 + 3 and one of 3 shift an int by the same), and the
+/// operands of the trace have one type, as NIR requires.
+template <typename LBase, typename>
+using ShiftOperandType = decltype(+std::declval<LBase>());
+
+/// Binary operator helper for arithmetic operations with integer promotion. LEFT_T is the type the left operand is
+/// converted to, RIGHT_T the one of the right operand, RIGHT_CONVERT how it gets there.
+#define DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(OP, OP_NAME, OP_TRACE, EVAL, LEFT_T, RIGHT_T, RIGHT_CONVERT)      \
 	template <typename LHS, typename RHS>                                                                              \
 	auto inline OP_NAME(LHS&& left, RHS&& right) {                                                                     \
 		using LHSVal = std::remove_cvref_t<LHS>;                                                                       \
 		using RHSVal = std::remove_cvref_t<RHS>;                                                                       \
 		using LBase = typename LHSVal::basic_type;                                                                     \
 		using RBase = typename RHSVal::basic_type;                                                                     \
-		using commonType = ArithmeticResultType<LBase, RBase>;                                                         \
+		using leftType = LEFT_T<LBase, RBase>;                                                                         \
+		using rightType = RIGHT_T<LBase, RBase>;                                                                       \
 		using resultType = decltype(std::declval<LBase>() OP std::declval<RBase>());                                   \
                                                                                                                        \
-		auto&& lValue = cast_value<LHS, commonType>(std::forward<LHS>(left));                                          \
-		auto&& rValue = cast_value<RHS, commonType>(std::forward<RHS>(right));                                         \
+		auto&& lValue = cast_value<LHS, leftType>(std::forward<LHS>(left));                                            \
+		auto&& rValue = RIGHT_CONVERT<RHS, rightType>(std::forward<RHS>(right));                                       \
                                                                                                                        \
 		if SHOULD_TRACE () {                                                                                           \
 			auto tc = tracing::traceBinaryOp(tracing::OP_TRACE, tracing::TypeResolver<resultType>::to_type(),          \
@@ -327,21 +337,31 @@ constexpr T wrappingMul(T a, T b) {
 	}                                                                                                                  \
 	/* The type OP_NAME converts both operands to. */                                                                  \
 	template <typename LBase, typename RBase>                                                                          \
-	using OP_NAME##_operand_t = ArithmeticResultType<LBase, RBase>;
+	using OP_NAME##_operand_t = RIGHT_T<LBase, RBase>;                                                                 \
+	/* The type of `a OP b` in C++, for operands of type A and B. */                                                   \
+	template <typename A, typename B>                                                                                  \
+	using OP_NAME##_result_t = decltype(std::declval<A>() OP std::declval<B>());
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(+, add, ADD, NAUTILUS_EVAL_ADD)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(+, add, ADD, NAUTILUS_EVAL_ADD, ArithmeticResultType, ArithmeticResultType,
+                                             cast_value)
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(-, sub, SUB, NAUTILUS_EVAL_SUB)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(-, sub, SUB, NAUTILUS_EVAL_SUB, ArithmeticResultType, ArithmeticResultType,
+                                             cast_value)
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(*, mul, MUL, NAUTILUS_EVAL_MUL)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(*, mul, MUL, NAUTILUS_EVAL_MUL, ArithmeticResultType, ArithmeticResultType,
+                                             cast_value)
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(/, div, DIV, NAUTILUS_EVAL_DIV)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(/, div, DIV, NAUTILUS_EVAL_DIV, ArithmeticResultType, ArithmeticResultType,
+                                             cast_value)
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(%, mod, MOD, NAUTILUS_EVAL_MOD)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(%, mod, MOD, NAUTILUS_EVAL_MOD, ArithmeticResultType, ArithmeticResultType,
+                                             cast_value)
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(>>, shr, RSH, NAUTILUS_EVAL_SHR)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(>>, shr, RSH, NAUTILUS_EVAL_SHR, ShiftOperandType, ShiftOperandType,
+                                             convert_value)
 
-DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(<<, shl, LSH, NAUTILUS_EVAL_SHL)
+DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(<<, shl, LSH, NAUTILUS_EVAL_SHL, ShiftOperandType, ShiftOperandType,
+                                             convert_value)
 
 /// Binary operator helper for comparison operations (no promotion)
 #define DEFINE_BINARY_OPERATOR_HELPER(OP, OP_NAME, OP_TRACE, RES_TYPE)                                                 \
@@ -368,7 +388,10 @@ DEFINE_BINARY_OPERATOR_HELPER_WITH_PROMOTION(<<, shl, LSH, NAUTILUS_EVAL_SHL)
 	}                                                                                                                  \
 	/* The type OP_NAME converts both operands to. */                                                                  \
 	template <typename LBase, typename RBase>                                                                          \
-	using OP_NAME##_operand_t = std::common_type_t<LBase, RBase>;
+	using OP_NAME##_operand_t = std::common_type_t<LBase, RBase>;                                                      \
+	/* The type of `a OP b` in C++, for operands of type A and B. */                                                   \
+	template <typename A, typename B>                                                                                  \
+	using OP_NAME##_result_t = decltype(std::declval<A>() OP std::declval<B>());
 
 DEFINE_BINARY_OPERATOR_HELPER(==, eq, EQ, bool)
 
@@ -405,11 +428,12 @@ DEFINE_BINARY_OPERATOR_HELPER(|, bOr, BOR, COMMON_RETURN_TYPE)
 
 DEFINE_BINARY_OPERATOR_HELPER(^, bXOr, BXOR, COMMON_RETURN_TYPE)
 
-/// How a raw literal enters `val<ValBase> OP literal` (or `literal OP val<ValBase>`), where the operator converts both
-/// operands to `Operand<ValBase, Raw>`. When that conversion gives the same result as the traced CAST for every value
-/// of the literal's type (integral to integral, floating point to floating point, or an integer every value of which
-/// the floating-point type represents exactly), the literal is converted in C++ and traced as one CONST of the operand
-/// type; otherwise it stays a CONST of its own type, and the operator traces the CAST.
+/// How a raw literal (or a `static_val`, see literal_raw) enters `val<ValBase> OP literal` (or `literal OP
+/// val<ValBase>`), where the operator converts both operands to `Operand<ValBase, Raw>`. When that conversion gives
+/// the same result as the traced CAST for every value of the literal's type (integral to integral, floating point to
+/// floating point, or an integer every value of which the floating-point type represents exactly), the literal is
+/// converted in C++ and traced as one CONST of the operand type; otherwise it stays a CONST of its own type, and the
+/// operator traces the CAST.
 template <template <typename, typename> typename Operand, typename ValBase, typename Raw>
 struct literal_operand {
 	static constexpr bool converts_in_cpp = false;
@@ -451,11 +475,16 @@ bool inline convertsLiteralsInCpp() {
 	auto inline operator OP(LHS&& left, RHS&& right) {                                                                 \
 		using Literal =                                                                                                \
 		    details::literal_operand<details::FUNC##_operand_t, typename std::remove_cvref_t<LHS>::basic_type,         \
-		                             std::remove_cvref_t<RHS>>;                                                        \
+		                             details::literal_raw_t<RHS>>;                                                     \
 		if constexpr (Literal::converts_in_cpp) {                                                                      \
-			if (details::convertsLiteralsInCpp()) {                                                                    \
-				using Operand = typename Literal::type;                                                                \
-				return details::FUNC(std::forward<LHS>(left), val<Operand>(static_cast<Operand>(right)));              \
+			using Operand = typename Literal::type;                                                                    \
+			using LBase = typename std::remove_cvref_t<LHS>::basic_type;                                               \
+			/* the folded operator must have the result type of the unfolded one */                                    \
+			if constexpr (std::is_same_v<details::FUNC##_result_t<LBase, details::literal_raw_t<RHS>>,                 \
+			                             details::FUNC##_result_t<LBase, Operand>>) {                                  \
+				if (details::convertsLiteralsInCpp()) {                                                                \
+					return details::FUNC(std::forward<LHS>(left), val<Operand>(static_cast<Operand>(right)));          \
+				}                                                                                                      \
 			}                                                                                                          \
 		}                                                                                                              \
 		auto&& rhsV = make_value(std::forward<RHS>(right));                                                            \
@@ -467,11 +496,16 @@ bool inline convertsLiteralsInCpp() {
 	auto inline operator OP(LHS&& left, RHS&& right) {                                                                 \
 		using Literal =                                                                                                \
 		    details::literal_operand<details::FUNC##_operand_t, typename std::remove_cvref_t<RHS>::basic_type,         \
-		                             std::remove_cvref_t<LHS>>;                                                        \
+		                             details::literal_raw_t<LHS>>;                                                     \
 		if constexpr (Literal::converts_in_cpp) {                                                                      \
-			if (details::convertsLiteralsInCpp()) {                                                                    \
-				using Operand = typename Literal::type;                                                                \
-				return details::FUNC(val<Operand>(static_cast<Operand>(left)), std::forward<RHS>(right));              \
+			using Operand = typename Literal::type;                                                                    \
+			using RBase = typename std::remove_cvref_t<RHS>::basic_type;                                               \
+			/* a shift has the type of its left operand: `3 << x` is an int whatever the type of x is */               \
+			if constexpr (std::is_same_v<details::FUNC##_result_t<details::literal_raw_t<LHS>, RBase>,                 \
+			                             details::FUNC##_result_t<Operand, RBase>>) {                                  \
+				if (details::convertsLiteralsInCpp()) {                                                                \
+					return details::FUNC(val<Operand>(static_cast<Operand>(left)), std::forward<RHS>(right));          \
+				}                                                                                                      \
 			}                                                                                                          \
 		}                                                                                                              \
 		auto&& lhsV = make_value(std::forward<LHS>(left));                                                             \

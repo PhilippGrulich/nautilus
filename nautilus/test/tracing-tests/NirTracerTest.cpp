@@ -46,3 +46,25 @@ TEST_CASE("the direct tracer and the 0.3 tracer converge to the same SSA", "[nir
 		}
 	}
 }
+
+TEST_CASE("runtime calls share their callee, signature and pointer entries", "[nir-tracer][calls]") {
+	// five calls of two functions: the callee cache of the tracer must hand out the ids interning would
+	common::Arena arena, arena03;
+	auto module = traceDirect(engine::details::createFunctionWrapper(runtimeCalls), arena);
+	REQUIRE(diagnostics(module).empty());
+	REQUIRE(module.callees.size() == 2);
+	REQUIRE(module.pointers.size() == 2);
+	REQUIRE(module.signatures.size() == 3); // the two callees and the function itself
+	REQUIRE(nir::print(conversion::convert(module)) ==
+	        nir::print(conversion::convert(trace03(engine::details::createFunctionWrapper(runtimeCalls), arena03))));
+}
+
+TEST_CASE("a function that needs a hoisted declaration keeps the arguments of its calls", "[nir-tracer][calls]") {
+	// the tracer writes the blocks in one pass and starts over, hoisting, when a declaration comes after a use; the
+	// calls renumbered by the first attempt must be back as they were
+	common::Arena arena, arena03;
+	auto module = traceDirect(engine::details::createFunctionWrapper(guardedCalls), arena);
+	REQUIRE(diagnostics(module).empty());
+	REQUIRE(nir::print(conversion::convert(module)) ==
+	        nir::print(conversion::convert(trace03(engine::details::createFunctionWrapper(guardedCalls), arena03))));
+}
