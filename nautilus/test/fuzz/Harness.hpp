@@ -42,6 +42,9 @@ struct Config {
 	std::string backend;
 	std::string label;
 	OptionsTweak tweak;
+	/// The engine promotes its modules to tier 1 in the background (policy `eager`, one worker): the kernel is run
+	/// before and after the promotion is installed, so the result is checked on both sides of the swap.
+	bool promotes = false;
 };
 
 /// The differential config matrix: for every backend compiled into this build
@@ -103,6 +106,14 @@ inline std::vector<Config> configs() {
 		// un-simplified lowering path against the simplified default.
 		result.push_back({backend, "no-algebraic-simpl",
 		                  legacy([](engine::Options& o) { o.setOption("ir.disableAlgebraicSimplification", true); })});
+		// Every scope of an explicit construct (If/Loop/While nodes the program writes with nautilus/control_flow.hpp)
+		// starts over once, so the rollback of what it recorded optimistically is exercised by every construct.
+		result.push_back({backend, "force-construct-restarts",
+		                  [](engine::Options& o) { o.setOption("tracing.forceConstructRestarts", true); }});
+		// Not swept: tracing.unwindPausedPasses (R4). The tail of a finished pass is not run, and the evaluators of
+		// this fuzzer keep host-side stacks (loop frames) that the tail pops; the first run of this peer failed on
+		// exactly that (NAUT-T004 for a frame left behind). R4 is for traced code without such bookkeeping, see
+		// docs/tracing.md.
 		for (auto& c : extra) {
 			result.push_back(std::move(c));
 		}
@@ -149,6 +160,12 @@ inline std::vector<Config> configs() {
 		      o.setOption("ir.enableLocalCSE", true);
 	      })}});
 #endif
+#if defined(ENABLE_TBC_BACKEND) &&                                                                                     \
+    (defined(ENABLE_MLIR_BACKEND) || defined(ENABLE_ASMJIT_BACKEND) || defined(ENABLE_C_BACKEND))
+	// Promotion forced (11-tiered-compilation.md §6): tier 0 is tbc, tier 1 the best other backend, queued eagerly on
+	// one worker. The kernel runs on tier 0, then again once tier 1 is installed.
+	result.push_back({"tiered", "default", {}, true});
+#endif
 	// Triage aid: NAUTILUS_FUZZ_BACKENDS=<comma-list> restricts the peers
 	// (e.g. "interpreter,tbc,tbc-jit" to bisect a finding to one backend).
 	if (const char* filter = std::getenv("NAUTILUS_FUZZ_BACKENDS")) {
@@ -166,6 +183,17 @@ inline engine::NautilusEngine makeEngine(const std::string& backend, const Optio
 	} else if (backend == "tbc-jit") {
 		options.setOption("engine.backend", std::string("tbc"));
 		options.setOption("tbc.mode", std::string("jit"));
+	} else if (backend == "tiered") {
+#if defined(ENABLE_MLIR_BACKEND)
+		options.setOption("engine.tier1.backend", std::string("mlir"));
+#elif defined(ENABLE_ASMJIT_BACKEND)
+		options.setOption("engine.tier1.backend", std::string("asmjit"));
+#else
+		options.setOption("engine.tier1.backend", std::string("cpp"));
+#endif
+		options.setOption("engine.tier0.backend", std::string("tbc"));
+		options.setOption("engine.tiered.promotion", std::string("eager"));
+		options.setOption("engine.tiered.promotionThreads", 1);
 	} else if (backend == "nir-tbc" || backend == "nir-tbc-jit") {
 		// the 0.3 tracer, mapped to NIR and converted
 		options.setOption("engine.backend", std::string("nirtbc"));
@@ -200,10 +228,35 @@ inline engine::NautilusEngine makeEngine(const std::string& backend, const Optio
 	return engine::NautilusEngine(options);
 }
 
+/// Runs the kernel with @p run and checks the result with @p check; for a config that promotes, waits for the
+/// promotion and does both again, so a miscompile of tier 1 or a result that changes across the swap is a finding.
+template <typename Run, typename Check>
+void runAcrossSwap(const Config& config, engine::NautilusEngine& engine, Run&& run, Check&& check) {
+	run();
+	check();
+	if (config.promotes) {
+		engine.waitForPromotions();
+		run();
+		check();
+	}
+}
+
 /// configs() computed once per process. The matrix only depends on the build
 /// and on NAUTILUS_FUZZ_BACKENDS, neither of which changes mid-run, so there
 /// is no reason to re-read the environment and rebuild the option closures for
 /// every one of the (many) inputs a long libFuzzer session executes.
+/// Whether the config traces with the 0.3 tracer (`tracing.nirTracer=false`, or the NIR chain from its trace).
+inline bool usesLegacyTracer(const Config& config) {
+	if (config.backend == "nir-tbc" || config.backend == "nir-tbc-jit") {
+		return true;
+	}
+	engine::Options options;
+	if (config.tweak) {
+		config.tweak(options);
+	}
+	return !options.getOptionOrDefault("tracing.nirTracer", true);
+}
+
 inline const std::vector<Config>& activeConfigs() {
 	static const std::vector<Config> cached = configs();
 	return cached;
@@ -443,19 +496,28 @@ std::vector<Finding> checkOneArity(ByteReader& reader) {
 	for (const auto& cfg : activeConfigs()) {
 		try {
 			auto engine = makeEngine(cfg.backend, cfg.tweak);
+			ExplicitControlFlowGuard explicitGuard(!usesLegacyTracer(cfg));
 			std::function<ArityKernelSignature<T, N>> kernel = [&ast](val<T*> mem, auto... a) {
 				TracedArgs<T, static_cast<std::size_t>(N)> traced {a...};
 				return evalNautilus<T>(ast, mem, traced);
 			};
 			auto compiled = engine.registerFunction(kernel);
-			memory = initialMemory;
-			const T got = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-				return compiled(memory.data(), args[Is]...);
-			}(std::make_index_sequence<static_cast<std::size_t>(N)> {});
-			if (!valuesEqual<T>(got, expected)) {
-				findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), shapeName, program, argStrs, memoryStrs,
-				                    formatValue<T>(expected), formatValue<T>(got), false, "", hasParam});
-			}
+			T got {};
+			runAcrossSwap(
+			    cfg, engine,
+			    [&] {
+				    memory = initialMemory;
+				    got = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+					    return compiled(memory.data(), args[Is]...);
+				    }(std::make_index_sequence<static_cast<std::size_t>(N)> {});
+			    },
+			    [&] {
+				    if (!valuesEqual<T>(got, expected)) {
+					    findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), shapeName, program, argStrs,
+					                        memoryStrs, formatValue<T>(expected), formatValue<T>(got), false, "",
+					                        hasParam});
+				    }
+			    });
 		} catch (const std::exception& e) {
 			findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), shapeName, program, argStrs, memoryStrs, "",
 			                    "", true, e.what(), hasParam});
@@ -499,17 +561,26 @@ std::vector<Finding> checkOneMixed(ByteReader& reader) {
 	for (const auto& cfg : activeConfigs()) {
 		try {
 			auto engine = makeEngine(cfg.backend, cfg.tweak);
+			ExplicitControlFlowGuard explicitGuard(!usesLegacyTracer(cfg));
 			std::function<MixedKernelSignature<T>> kernel = [&ast](val<T*> mem, val<S> p0, val<T> p1, val<T> p2) {
 				TracedArgs<T, N> traced {convertClampedTraced<S, T>(p0), p1, p2};
 				return evalNautilus<T>(ast, mem, traced);
 			};
 			auto compiled = engine.registerFunction(kernel);
-			memory = initialMemory;
-			const T got = compiled(memory.data(), secondaryRaw, arg1, arg2);
-			if (!valuesEqual<T>(got, expected)) {
-				findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "mixed", program, argStrs, memoryStrs,
-				                    formatValue<T>(expected), formatValue<T>(got), false, "", hasParam});
-			}
+			T got {};
+			runAcrossSwap(
+			    cfg, engine,
+			    [&] {
+				    memory = initialMemory;
+				    got = compiled(memory.data(), secondaryRaw, arg1, arg2);
+			    },
+			    [&] {
+				    if (!valuesEqual<T>(got, expected)) {
+					    findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "mixed", program, argStrs,
+					                        memoryStrs, formatValue<T>(expected), formatValue<T>(got), false, "",
+					                        hasParam});
+				    }
+			    });
 		} catch (const std::exception& e) {
 			findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "mixed", program, argStrs, memoryStrs, "", "",
 			                    true, e.what(), hasParam});
@@ -556,19 +627,27 @@ std::vector<Finding> checkOneNarrowReturn(ByteReader& reader) {
 	for (const auto& cfg : activeConfigs()) {
 		try {
 			auto engine = makeEngine(cfg.backend, cfg.tweak);
+			ExplicitControlFlowGuard explicitGuard(!usesLegacyTracer(cfg));
 			std::function<NarrowReturnKernelSignature<T>> kernel = [&ast](val<T*> mem, val<T> a, val<T> b, val<T> c) {
 				TracedArgs<T, N> traced {a, b, c};
 				TracedValue<T> result = evalNautilus<T>(ast, mem, traced);
 				return convertClampedTraced<T, NarrowReturnType>(result);
 			};
 			auto compiled = engine.registerFunction(kernel);
-			memory = initialMemory;
-			const NarrowReturnType got = compiled(memory.data(), args[0], args[1], args[2]);
-			if (!valuesEqual<NarrowReturnType>(got, expected)) {
-				findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "narrowReturn", program, argStrs,
-				                    memoryStrs, formatValue<NarrowReturnType>(expected),
-				                    formatValue<NarrowReturnType>(got), false, "", hasParam});
-			}
+			NarrowReturnType got {};
+			runAcrossSwap(
+			    cfg, engine,
+			    [&] {
+				    memory = initialMemory;
+				    got = compiled(memory.data(), args[0], args[1], args[2]);
+			    },
+			    [&] {
+				    if (!valuesEqual<NarrowReturnType>(got, expected)) {
+					    findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "narrowReturn", program, argStrs,
+					                        memoryStrs, formatValue<NarrowReturnType>(expected),
+					                        formatValue<NarrowReturnType>(got), false, "", hasParam});
+				    }
+			    });
 		} catch (const std::exception& e) {
 			findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "narrowReturn", program, argStrs, memoryStrs,
 			                    "", "", true, e.what(), hasParam});
@@ -620,19 +699,26 @@ std::vector<Finding> checkOneVoidReturn(ByteReader& reader) {
 	for (const auto& cfg : activeConfigs()) {
 		try {
 			auto engine = makeEngine(cfg.backend, cfg.tweak);
+			ExplicitControlFlowGuard explicitGuard(!usesLegacyTracer(cfg));
 			std::function<VoidReturnKernelSignature<T>> kernel = [&ast](val<T*> mem, val<T> a, val<T> b, val<T> c) {
 				TracedArgs<T, N> traced {a, b, c};
 				TracedValue<T> result = evalNautilus<T>(ast, mem, traced);
 				*mem = result;
 			};
 			auto compiled = engine.registerFunction(kernel);
-			memory = initialMemory;
-			compiled(memory.data(), args[0], args[1], args[2]);
-			if (!arraysEqual<T, BUFFER_ELEMS>(memory, expectedMemory)) {
-				findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "voidReturn", program, argStrs, memoryStrs,
-				                    formatArray<T, BUFFER_ELEMS>(expectedMemory), formatArray<T, BUFFER_ELEMS>(memory),
-				                    false, "", hasParam});
-			}
+			runAcrossSwap(
+			    cfg, engine,
+			    [&] {
+				    memory = initialMemory;
+				    compiled(memory.data(), args[0], args[1], args[2]);
+			    },
+			    [&] {
+				    if (!arraysEqual<T, BUFFER_ELEMS>(memory, expectedMemory)) {
+					    findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "voidReturn", program, argStrs,
+					                        memoryStrs, formatArray<T, BUFFER_ELEMS>(expectedMemory),
+					                        formatArray<T, BUFFER_ELEMS>(memory), false, "", hasParam});
+				    }
+			    });
 		} catch (const std::exception& e) {
 			findings.push_back({cfg.backend, cfg.label, typeSuffix<T>(), "voidReturn", program, argStrs, memoryStrs, "",
 			                    "", true, e.what(), hasParam});
@@ -734,6 +820,7 @@ inline std::vector<Finding> checkOneEnum(ByteReader& reader) {
 	for (const auto& cfg : activeConfigs()) {
 		try {
 			auto engine = makeEngine(cfg.backend, cfg.tweak);
+			ExplicitControlFlowGuard explicitGuard(!usesLegacyTracer(cfg));
 			// The kernel returns val<Underlying>, not val<FuzzEnum>: unlike
 			// every other domain here, val<FuzzEnum>::raw_type (Underlying) is
 			// NOT val<FuzzEnum> itself (val_enum.hpp), so registerFunction's
@@ -749,13 +836,20 @@ inline std::vector<Finding> checkOneEnum(ByteReader& reader) {
 				    return static_cast<val<Underlying>>(result);
 			    };
 			auto compiled = engine.registerFunction(kernel);
-			memory = initialMemory;
-			const FuzzEnum got = static_cast<FuzzEnum>(compiled(memory.data(), args[0], args[1], args[2]));
-			if (!valuesEqual<FuzzEnum>(got, expected)) {
-				findings.push_back({cfg.backend, cfg.label, typeSuffix<FuzzEnum>(), "arity3", program, argStrs,
-				                    memoryStrs, formatValue<FuzzEnum>(expected), formatValue<FuzzEnum>(got), false, "",
-				                    hasParam});
-			}
+			FuzzEnum got {};
+			runAcrossSwap(
+			    cfg, engine,
+			    [&] {
+				    memory = initialMemory;
+				    got = static_cast<FuzzEnum>(compiled(memory.data(), args[0], args[1], args[2]));
+			    },
+			    [&] {
+				    if (!valuesEqual<FuzzEnum>(got, expected)) {
+					    findings.push_back({cfg.backend, cfg.label, typeSuffix<FuzzEnum>(), "arity3", program, argStrs,
+					                        memoryStrs, formatValue<FuzzEnum>(expected), formatValue<FuzzEnum>(got),
+					                        false, "", hasParam});
+				    }
+			    });
 		} catch (const std::exception& e) {
 			findings.push_back({cfg.backend, cfg.label, typeSuffix<FuzzEnum>(), "arity3", program, argStrs, memoryStrs,
 			                    "", "", true, e.what(), hasParam});

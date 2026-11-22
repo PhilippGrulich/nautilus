@@ -16,14 +16,22 @@ set(NAUTILUS_EXECUTION_TEST_SOURCES
         ConcurrentCompilationTest.cpp
         ConcurrentExecutionTest.cpp
         DumpHelperTest.cpp
+        ExplicitControlFlowTest.cpp
         FunctionPtrExecutionTest.cpp
 		InvokeExceptionExecutionTest.cpp
         LiteralOperandExecutionTest.cpp
         NoThrowInferenceIntegrationTest.cpp
+        OptionalPassesTest.cpp
         MemoryIntrinsicExecutionTest.cpp
+        ModuleExplainTest.cpp
         ModuleLifecycleTest.cpp
+        ModuleLinkingTest.cpp
+        ModuleRegistryTest.cpp
         ModuleTest.cpp
         TieredCompilationTest.cpp
+        TracingDiagnosticsTest.cpp
+        TracingFrontendTest.cpp
+        PromotionServiceTest.cpp
         ArenaMemoryTest.cpp
         PointerExecutionTest.cpp
         RegionTest.cpp
@@ -44,7 +52,8 @@ endif ()
 
 if (ENABLE_ASMJIT_BACKEND)
     list(APPEND NAUTILUS_EXECUTION_TEST_SOURCES
-            backends/asmjit/ConcurrentExecutionTest.cpp)
+            backends/asmjit/ConcurrentExecutionTest.cpp
+            backends/asmjit/ProfilingSymbolsTest.cpp)
 endif ()
 
 if (ENABLE_MLIR_BACKEND)

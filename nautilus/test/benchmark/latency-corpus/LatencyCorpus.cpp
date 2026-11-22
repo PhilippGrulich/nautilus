@@ -13,6 +13,10 @@
 #include "nautilus/config.hpp"
 #include "nautilus/function.hpp"
 #include "nautilus/region.hpp"
+#if __has_include("nautilus/control_flow.hpp")
+#include "nautilus/control_flow.hpp"
+#define NAUTILUS_CORPUS_EXPLICIT 1
+#endif
 #include "nautilus/static.hpp"
 #include <algorithm>
 #include <atomic>
@@ -130,6 +134,22 @@ static val<int64_t> loopBody(val<int64_t> n) {
 	return r;
 }
 
+// A variable that is assigned in the loop body the (loop-invariant) value it holds anyway (03 §3.2, M3.10): the
+// loop-carried variable is trivial, and everything computed from it folds as it did in 0.3. Counts the refold sweep of
+// the conversion.
+static val<int64_t> loopInvariantReassign(val<int64_t> n) {
+	val<int64_t> m = n + 7;
+	val<int64_t> k = m;
+	val<int64_t> r = 0;
+	for (val<int64_t> j = 0; j < n; j = j + 1) {
+		for (static_val<int> i = 0; i < N; i++) {
+			k = m;
+			r = r + k * i;
+		}
+	}
+	return r;
+}
+
 // N runtime calls.
 static val<int64_t> calls(val<int64_t> x) {
 	val<int64_t> r = x;
@@ -138,6 +158,38 @@ static val<int64_t> calls(val<int64_t> x) {
 	}
 	return r;
 }
+
+// The explicit control-flow twins of chainedIf and loopBody (docs/plans/nautilus-0.4/01-tracing-frontend.md §5): the
+// same functions written with If and For, which trace in one pass. The corpus is also built against 0.3, which has no
+// explicit constructs: there the twins are the implicit functions, so that the callgrind gate compares the 0.4 twin
+// with the 0.3 cost of the same computation.
+#ifdef NAUTILUS_CORPUS_EXPLICIT
+static val<int64_t> chainedIfExplicit(val<int64_t> x) {
+	val<int64_t> r = 0;
+	for (static_val<int> i = 0; i < N; i++) {
+		If(x > i, [&] { r = r + 1; });
+	}
+	return r;
+}
+
+static val<int64_t> loopBodyExplicit(val<int64_t> n) {
+	val<int64_t> r = 1;
+	For(val<int64_t>(0), n, [&](val<int64_t> j) {
+		for (static_val<int> i = 0; i < N; i++) {
+			r = r + j * i;
+		}
+	});
+	return r;
+}
+#else
+static val<int64_t> chainedIfExplicit(val<int64_t> x) {
+	return chainedIf(x);
+}
+
+static val<int64_t> loopBodyExplicit(val<int64_t> n) {
+	return loopBody(n);
+}
+#endif
 
 // 1024 distinct call sites (no static_val): stresses tag creation / the tag trie.
 #define NAUTILUS_SITE r = r * 3 + 1;
@@ -206,6 +258,9 @@ int main(int argc, char** argv) {
 	    {"chainedIf", chainedIf, {10, 100, 300}},
 	    {"chainedIfRegion", chainedIfRegion, {10, 100, 300}},
 	    {"loopBody", loopBody, {100, 1000, 10000}},
+	    {"chainedIfExplicit", chainedIfExplicit, {10, 100, 300}},
+	    {"loopBodyExplicit", loopBodyExplicit, {100, 1000, 10000}},
+	    {"loopInvariantReassign", loopInvariantReassign, {100, 1000}},
 	    {"calls", calls, {100, 1000, 5000}},
 	    {"distinctSites1024", distinctSites1024, {1}},
 	};
@@ -242,7 +297,8 @@ int main(int argc, char** argv) {
 				}
 				std::vector<double> totals, traces, irgens, passes, backendMs;
 				std::vector<uint64_t> allocs;
-				int64_t irOps = -1, baselineOps = -1;
+				int64_t irOps = -1, baselineOps = -1, nirOps = -1, refoldSweeps = -1, refoldedInsts = -1,
+				        iterations = -1;
 				std::string lastStats;
 				for (int rep = 0; rep < repetitions; rep++) {
 					engine::NautilusEngine engine(options);
@@ -264,6 +320,12 @@ int main(int argc, char** argv) {
 					backendMs.push_back(statMs(*stats, "backend.totalMs"));
 					irOps = statInt(*stats, "ir.operations");
 					baselineOps = statInt(*stats, "irPasses.baseline.operations");
+					// the NIR pipeline: instructions after conversion (the op count against 0.3's `ir_ops`), the refold
+					// sweeps of 03 §3.2 and the rounds of optional passes (0 on a default compile, 03 §6)
+					nirOps = statInt(*stats, "conversion.instructions");
+					refoldSweeps = statInt(*stats, "conversion.refoldSweeps");
+					refoldedInsts = statInt(*stats, "conversion.refoldedInsts");
+					iterations = statInt(*stats, "irPasses.pipelineIterations");
 					lastStats = stats->toJson();
 					// Make sure the code runs (and is not a stale handle).
 					volatile auto result = fn(int64_t {3});
@@ -283,9 +345,12 @@ int main(int argc, char** argv) {
 				             opsForRate > 0 ? total * 1e6 / static_cast<double>(opsForRate) : 0.0);
 				std::printf("{\"function\":\"%s\",\"n\":%d,\"backend\":\"%s\",\"total_ms\":%.4f,\"tracing_ms\":%.4f,"
 				            "\"irgen_ms\":%.4f,\"passes_ms\":%.4f,\"backend_ms\":%.4f,\"ir_ops_before_passes\":%lld,"
-				            "\"ir_ops\":%lld,\"allocations\":%llu,\"stats\":%s}\n",
+				            "\"ir_ops\":%lld,\"nir_ops\":%lld,\"refold_sweeps\":%lld,\"refolded_insts\":%lld,"
+				            "\"pipeline_iterations\":%lld,\"allocations\":%llu,\"stats\":%s}\n",
 				            entry.name, size, backend.c_str(), total, median(traces), median(irgens), median(passes),
 				            median(backendMs), static_cast<long long>(baselineOps), static_cast<long long>(irOps),
+				            static_cast<long long>(nirOps), static_cast<long long>(refoldSweeps),
+				            static_cast<long long>(refoldedInsts), static_cast<long long>(iterations),
 				            static_cast<unsigned long long>(allocs[allocs.size() / 2]), lastStats.c_str());
 				std::fflush(stdout);
 			}

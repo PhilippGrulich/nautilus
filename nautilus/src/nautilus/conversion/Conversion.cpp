@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -474,6 +475,8 @@ private:
 	uint32_t padFor(const std::vector<std::pair<uint32_t, Ref>>& entries);
 	uint32_t convertUnwind(uint32_t b, uint32_t cleanupOffset);
 	Ref simplify(Inst& inst);
+	/// A load from a data object at a constant offset, as the constant it reads (13 §5.8); NONE if it is not one.
+	[[gnu::noinline]] Ref foldDataLoad(const Inst& inst);
 
 	// ---- common subexpressions (M3.4) --------------------------------------------------------------------------
 	// Available values are recorded with the block that computed them, and the blocks are chained to their only static
@@ -561,8 +564,9 @@ private:
 	std::vector<uint32_t> fwd_;
 	uint32_t phisForwarded_ = 0; // the phis that tryRemoveTrivialPhi forwarded to another value
 	std::vector<BlockState> states_;
-	std::vector<uint32_t> bodyAll_;       // the temporaries of the instructions, block by block, terminator last
-	FlatMap currentDef_;                  // (block, variable) -> value
+	std::vector<uint32_t> bodyAll_; // the temporaries of the instructions, block by block, terminator last
+	std::vector<uint32_t> bodySrc_; // parallel to `bodyAll_`, with debug data: the pre-SSA instruction each came from
+	FlatMap currentDef_;            // (block, variable) -> value
 	std::vector<uint32_t> incomingEdges_; // per block a slice (at preds_.start) of its live incoming edge ids
 	std::vector<Ref> valueOf_;            // pre-SSA instruction id -> value, for ids that are never assigned
 	std::vector<PhiInfo> phiInfo_;
@@ -1206,6 +1210,56 @@ Ref FunctionConverter::simplify(Inst& ni) {
 	}
 }
 
+Ref FunctionConverter::foldDataLoad(const Inst& ni) {
+	using namespace semantics;
+	const auto type = static_cast<TypeId>(ni.type);
+	auto isC = [&](Ref r) {
+		return isConstRef(r);
+	};
+	auto bitsOf = [&](Ref r) {
+		return out().consts.record(r).bits;
+	};
+	auto make = [&](uint64_t bits, TypeId t, std::initializer_list<Ref>) -> Ref {
+		return out().consts.intern(t, Provenance::Literal, bits);
+	};
+	// a load from a data object at a constant offset reads bytes the module owns (13 §5.8): `data.addr`, possibly
+	// advanced by constant `add`s
+	const bool scalar = type == TypeId::I8 || type == TypeId::I16 || type == TypeId::I32 || type == TypeId::I64 ||
+	                    type == TypeId::F32 || type == TypeId::F64;
+	if (!scalar) {
+		return NONE;
+	}
+	uint64_t offset = 0;
+	Ref base = ni.a;
+	for (int depth = 0; depth < 16 && isTemp(base); ++depth) {
+		base = resolve(base);
+		const auto& t = temps_[base];
+		if (t.kind != Kind::Inst) {
+			return NONE;
+		}
+		if (t.inst.op == static_cast<uint16_t>(Op::DataAddr)) {
+			if (t.inst.a >= pre().data.size()) {
+				return NONE;
+			}
+			const auto& object = pre().data[t.inst.a];
+			const uint64_t size = widthOf(type) / 8;
+			if (offset > object.size || size > object.size - offset || offset % size != 0 || object.align < size) {
+				return NONE; // outside the object or not aligned: undefined, so left to run
+			}
+			uint64_t bits = 0;
+			std::memcpy(&bits, pre().dataBytes.data() + object.byteOffset + offset, size);
+			return make(bits, type, {});
+		}
+		if (t.inst.op == static_cast<uint16_t>(Op::Add) && t.type == TypeId::Ptr && isC(t.inst.b)) {
+			offset += bitsOf(t.inst.b);
+			base = t.inst.a;
+			continue;
+		}
+		return NONE;
+	}
+	return NONE;
+}
+
 void FunctionConverter::convertInstruction(uint32_t b, uint32_t id, const Inst& inst) {
 	const auto op = static_cast<Op>(inst.op);
 	switch (op) {
@@ -1241,7 +1295,7 @@ void FunctionConverter::convertInstruction(uint32_t b, uint32_t id, const Inst& 
 		ni.c = operand(inst.c, b);
 	}
 	if (optimize_) {
-		if (Ref folded = simplify(ni); folded != NONE) {
+		if (Ref folded = op == Op::Load ? foldDataLoad(ni) : simplify(ni); folded != NONE) {
 			++stats().folded;
 			if (isVariable_[id]) {
 				setDef(id, b, folded);
@@ -1424,10 +1478,17 @@ void FunctionConverter::convertTerminator(uint32_t b, const Inst& inst) {
 void FunctionConverter::convertBlock(uint32_t b) {
 	const auto ids = blockIds(b);
 	states_[b].bodyBegin = static_cast<uint32_t>(bodyAll_.size());
+	const bool debug = pre().hasDebugData();
 	for (size_t k = 0; k + 1 < ids.size(); ++k) {
 		convertInstruction(b, ids[k], insts_[ids[k]]);
+		if (debug) {
+			bodySrc_.resize(bodyAll_.size(), ids[k]);
+		}
 	}
 	convertTerminator(b, insts_[ids.back()]);
+	if (debug) {
+		bodySrc_.resize(bodyAll_.size(), ids.back());
+	}
 	states_[b].bodyEnd = static_cast<uint32_t>(bodyAll_.size());
 }
 
@@ -1652,6 +1713,17 @@ void FunctionConverter::emit() {
 	for (const auto& a : pre().functionAllocas(f_)) {
 		builder.addAlloca(a.size, a.align);
 	}
+	// Debug data (D14): the region of an instruction is that of the pre-SSA block it was emitted from. The sections are
+	// parallel to `insts`, so they grow with every block; a function that is not in a region keeps NONE.
+	const bool debug = pre().hasDebugData();
+	auto& debugRegions = out().debugInstRegions;
+	const auto regionOfBlock = [&](uint32_t b) {
+		return blocks_[b].count == 0 ? NONE : pre().regionOf(f_, pre().extra[blocks_[b].first]);
+	};
+	// an instruction is in the region its pre-SSA instruction was recorded in; a block parameter, in that of its block
+	const auto setRegion = [&](uint32_t region) {
+		debugRegions.resize(out().insts.size(), region);
+	};
 	for (uint32_t li = 0; li < emitOrder_.size(); ++li) {
 		const auto b = emitOrder_[li];
 		builder.beginBlock(static_cast<uint16_t>(states_[b].finalPhis), 0);
@@ -1664,11 +1736,16 @@ void FunctionConverter::emit() {
 			Ref id = builder.emit(Op::BlockArg, temps_[phi].type, 0, position++);
 			assert(id == finalId_[phi]);
 			(void) id;
+			if (debug) {
+				setRegion(regionOfBlock(b));
+			}
 			if (temps_[phi].kind == Kind::Phi) {
 				++stats().phis;
 			}
 		}
-		for (auto t : bodyOf(b)) {
+		const auto body = bodyOf(b);
+		for (size_t position_ = 0; position_ < body.size(); ++position_) {
+			const auto t = body[position_];
 			if (!marked_[t]) {
 				continue;
 			}
@@ -1735,6 +1812,12 @@ void FunctionConverter::emit() {
 			assert(id == finalId_[t]);
 			(void) id;
 			++stats().instructions;
+			if (debug) {
+				setRegion(pre().regionOf(f_, bodySrc_[states_[b].bodyBegin + position_]));
+			}
+		}
+		if (debug) {
+			setRegion(regionOfBlock(b));
 		}
 	}
 	// landing pads, in the order of their first reference
@@ -1752,6 +1835,10 @@ void FunctionConverter::emit() {
 		++stats().instructions;
 	}
 	builder.endFunction();
+	if (debug) {
+		debugRegions.resize(out().insts.size(), NONE);
+		out().debugInstLocations.resize(out().insts.size(), NONE);
+	}
 	++stats().functions;
 }
 
@@ -1772,6 +1859,7 @@ void FunctionConverter::reset(uint32_t function) {
 	calls_.clear();
 	words_.clear();
 	bodyAll_.clear();
+	bodySrc_.clear();
 	pads_.clear();
 	padIndex_.clear();
 	dynEdges_.clear();
@@ -1859,6 +1947,9 @@ Module convert(const Module& preSSA, const ConversionOptions& options, Conversio
 	}
 	// the result shares the tables of the input and writes the bodies anew
 	Module out = preSSA.copyTables();
+	// the per-instruction debug sections are parallel to the pre-SSA instructions: the conversion writes its own
+	out.debugInstRegions.clear();
+	out.debugInstLocations.clear();
 	out.callees = callees;
 	// the signatures keep their parameter types in `extra`; the instruction lists of the pre-SSA functions do not
 	// come along

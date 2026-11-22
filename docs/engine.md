@@ -108,6 +108,64 @@ For debugging purposes, you can disable compilation entirely. When compilation i
 options.setOption("engine.Compilation", false);
 ```
 
+## Tiered Compilation and Promotion
+
+Without `engine.backend`, the engine compiles in two tiers. `compile()` returns a module that runs on a fast **tier 0**
+executable (`asmjit`, else `tbc`, else the interpreter), and the **tier 1** executable (`mlir`) is compiled in the
+background and swapped in; the `ModuleFunction` handles you hold pick it up on their next call. A call that is running
+when the swap happens finishes in the tier it started in, and a superseded executable lives as long as the handles that
+resolved it. `engine.backend=<x>` pins one backend and compiles single-tier, synchronously.
+
+The tiers are set with `engine.tier0.backend` and `engine.tier1.backend`, each alone or both; a backend that is not built
+fails when the engine is created.
+
+### The promotion service
+
+Each engine owns a **promotion service**: a pool of `engine.tiered.promotionThreads` worker threads (default a quarter
+of the hardware threads, at least one) that compile the tier 1 of all of the engine's modules. The workers are created
+with the first promotion, run at a lower OS priority than your threads, and live as long as the engine, so the number
+of threads stays the same however many modules you compile, and the state a backend keeps per thread (the MLIR context
+and target machines) is reused by every promotion after a worker's first. `engine.tiered.maxQueuedPromotions` caps how
+many promotions may wait: a module beyond the cap stays on tier 0 with the status `skipped`.
+
+A promotion whose module is dropped is cancelled: it is dropped when a worker dequeues it, and a running one ends at the
+next stage boundary of the backend (after the MLIR generation, after the LLVM optimization), installing nothing.
+Destroying the engine cancels the queued promotions and waits only for the compiles that are running, at most one per
+worker. No lock is held while waiting, so `compile()` on other threads is never held up by a wait.
+
+With the default policy the promotion is queued right after the trace was converted, **before** the tier-0 code
+generation, so a tier 1 that finishes first is installed and the late tier-0 executable is dropped.
+
+### Policy
+
+`engine.tiered.promotion` selects when a module is promoted:
+
+- `eager` (default): every module, right after conversion.
+- `manual`: only when you call `CompiledModule::promote()`, for example once a query is known to be long-running.
+  `promote()` from several threads at once queues one job.
+
+### Status
+
+```cpp
+auto compiled = module.compile();
+
+compiled.tier();             // Tier::interpreted, Tier::tier0 or Tier::tier1
+compiled.promotionStatus();  // {PromotionState::queued, ...}: none, queued, running, done, failed, cancelled, skipped
+compiled.waitForPromotion(); // waits for this module only; with a timeout, returns false if it passed
+compiled.promote();          // policy manual: queue the promotion now
+
+engine.waitForPromotions();  // waits until no promotion of the engine is queued or running
+```
+
+A promotion that throws leaves the module on tier 0 with the status `failed` and the message in
+`promotionStatus().error`; it is logged once and not retried. `engine.logStatistics` and `NAUTILUS_STATISTICS_FILE`
+report a promotion as its own compile: the unit ID is the tier-0 one plus `_tier1`, `compilation.tier0UnitId` links the
+two, and `promotion.queueMs`, `promotion.compileMs`, `promotion.timeToTier1Ms` and `promotion.status` (with
+`promotion.error` on failure) describe it.
+
+`engine.tiered.backgroundPromotion=false` is a deprecated alias that compiles single-tier with the tier-1 backend; it
+wins over `engine.tiered.promotion` when both are set, with a warning. Prefer `engine.backend`.
+
 ## Modules
 
 When you need to compile multiple functions together into a single compilation unit, use modules. All functions registered with a module share one IR graph and are compiled by the same backend in one pass.
@@ -149,6 +207,43 @@ for (...) {
     // use compiled ...
 } // each `compiled` (and its executable) is freed here; the engine lives on
 ```
+
+### Named Modules and Imports
+
+A module with a name is registered with its engine when it is compiled, and modules compiled after it can call its
+functions. Use this to compile a library of functions once and share it among many queries:
+
+```cpp
+auto math = engine.createModule("lib.math");
+math.registerFunction<val<uint64_t>(val<uint64_t>)>("hash", [](val<uint64_t> x) { return x * 31 + 7; });
+auto lib = math.compile();                       // registered as "lib.math"
+
+auto query = engine.createModule("nes.query42");
+auto hash = query.importFunction<uint64_t(uint64_t)>("lib.math", "hash");
+query.registerFunction<val<uint64_t>(val<uint64_t>)>("run", [hash](val<uint64_t> x) { return hash(hash(x)); });
+auto compiled = query.compile();                 // links "lib.math"."hash"
+```
+
+`importFunction` takes the *raw* signature of the function. The call is traced as a call through an import slot, a
+cell that holds the entry point of the exporter's current code, so the exporter can be promoted to another tier without
+recompiling the importer: the engine points the slot at the new code, and calls that are running finish in the old.
+
+`compile()` links the imports and fails with a `link::LinkError` that names the import if the module is not
+registered or not compiled, the function is not exported, its signature is not exactly the one imported (extension
+kinds of narrow integers included), the export does not give the guarantees the import assumes, or the import graph
+would have a cycle. Nothing is bound when a link fails, and the name of the module that failed stays free.
+`importFunction` checks the signature at once if the exporter is already compiled.
+
+* A name refers to one module of an engine; compiling a second module under a registered name fails.
+* An importer pins its exporters: letting go of the exporter's `CompiledModule` keeps it (and its name) alive until the
+  last module that imports from it is gone.
+* Imports take over the guarantees the export gives (`module.setFunctionAttributes("hash", attributes)` declares
+  them for a function, as `invoke(attributes, ...)` does for a native one). Pass `FunctionAttributes` to
+  `importFunction` to assume less, or more, which the link then checks. A call that may throw goes through a thunk that
+  carries the exception across the tiers, whichever the exporter's current tier is.
+* Imports are linked on the default (NIR) pipeline of the `tbc`, `cpp`, `asmjit` and `mlir` backends. With
+  `tracing.nirTracer=false` (or `debug` and `perf`, which select the 0.3 pipeline) a call of an imported function
+  throws. An engine that interprets (`engine.compilation=false`) calls the exporter by name.
 
 ### Memory Use of a Long-Running Engine
 

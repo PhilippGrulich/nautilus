@@ -7,6 +7,7 @@
 #include "nautilus/compiler/ir/IRGraph.hpp"
 #include "nautilus/config.hpp"
 #include "nautilus/exceptions/RuntimeException.hpp"
+#include "nautilus/link/LinkSession.hpp"
 #include "nautilus/logging.hpp"
 #include <algorithm>
 #include <atomic>
@@ -15,7 +16,9 @@
 #include <fmt/core.h>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -41,8 +44,10 @@
 #include "nautilus/compiler/ir/passes/StrengthReductionPass.hpp"
 #include "nautilus/compiler/ir/util/GraphVizUtil.hpp"
 #include "nautilus/conversion/Conversion.hpp"
+#include "nautilus/extensions/ExtensionRegistry.hpp"
 #include "nautilus/nir/Printer.hpp"
 #include "nautilus/nir/Verifier.hpp"
+#include "nautilus/passes/Passes.hpp"
 #include "nautilus/tracing/CopyAttribution.hpp"
 #include "nautilus/tracing/TraceContext.hpp"
 #include "nautilus/tracing/nir/NirTrace.hpp"
@@ -233,7 +238,27 @@ void recordTracingStatistics(CompilationStatistics& statistics, const tracing::T
 		s.set("tracing.rerun.follow.ms", t.rerunFollowMs);
 		s.set("tracing.rerun.record.ms", t.rerunRecordMs);
 		s.set("tracing.rerun.paused.ms", t.rerunPausedMs);
+		// the share of the pass time that went into re-runs (0 when nothing ran twice): the target of R1-R4
+		const double passes = t.firstRunMs + t.rerunMs;
+		s.set("tracing.rerun.share", passes > 0 ? t.rerunMs / passes : 0.0);
+		s.set("tracing.unwoundPasses", static_cast<int64_t>(t.unwoundPasses));
+		s.set("tracing.unwindFallbacks", static_cast<int64_t>(t.unwindFallbacks));
+		s.set("tracing.constructs", static_cast<int64_t>(t.constructs));
+		s.set("tracing.constructRestarts", static_cast<int64_t>(t.constructRestarts));
 	});
+}
+
+/// The warnings of the tracer (docs/diagnostics.md) as `diagnostics.count` and
+/// `diagnostics.<n>.{code,message,hint,location}`.
+void recordTracingDiagnostics(CompilationStatistics& statistics, const std::vector<tracing::TracingDiagnostic>& list) {
+	statistics.set("diagnostics.count", static_cast<int64_t>(list.size()));
+	for (size_t i = 0; i < list.size(); ++i) {
+		const auto prefix = "diagnostics." + std::to_string(i) + ".";
+		statistics.set(prefix + "code", list[i].code);
+		statistics.set(prefix + "message", list[i].message);
+		statistics.set(prefix + "hint", list[i].hint);
+		statistics.set(prefix + "location", list[i].location());
+	}
 }
 
 /// Throws if `module` does not verify; `what` names the module in the message.
@@ -282,6 +307,10 @@ nir::Module convertToSSA(const nir::Module& pre, const engine::ModuleOptions& mo
 			s.set("conversion.deadValues", static_cast<int64_t>(conversionStats.deadValues));
 			s.set("conversion.foldedBranches", static_cast<int64_t>(conversionStats.foldedBranches));
 			s.set("conversion.loops", static_cast<int64_t>(conversionStats.loops));
+			// no optional pass has run yet; the passes that do set the key themselves (03 §6)
+			if (!s.containsDirect("irPasses.pipelineIterations")) {
+				s.set("irPasses.pipelineIterations", int64_t {0});
+			}
 		});
 	}
 	if (verify) {
@@ -300,6 +329,219 @@ nir::Module convertToSSA(const nir::Module& pre, const engine::ModuleOptions& mo
 	return ssa;
 }
 
+/// The options of passes that 0.3 had and 0.4 does not: the conversion does what they did (03 §2.1). They are accepted
+/// and ignored, with one warning each per process.
+void warnRemovedPassOptions(const engine::ModuleOptions& options) {
+	static constexpr std::string_view removed[] = {"ir.disableConstantFolding",
+	                                               "ir.disableAlgebraicSimplification",
+	                                               "ir.disableConstantBranchFolding",
+	                                               "ir.disableEmptyBlockElimination",
+	                                               "ir.disableBlockMerging",
+	                                               "ir.disableDeadCodeElimination",
+	                                               "ir.disableBlockArgumentPruning",
+	                                               "ir.disableAttributeInference",
+	                                               "ir.enableLocalCSE"};
+	static std::mutex mutex;
+	static std::set<std::string_view> warned;
+	for (const auto name : removed) {
+		if (!options.hasOption(name)) {
+			continue;
+		}
+		const std::lock_guard<std::mutex> lock(mutex);
+		if (warned.insert(name).second) {
+			log::warn("The option '{}' belongs to an IR pass that 0.4 does not have: the conversion folds, simplifies, "
+			          "merges, removes dead code and infers attributes on its own. The option is ignored.",
+			          std::string(name));
+		}
+	}
+}
+
+/// What a pipeline of passes did, added to the statistics under `irPasses.*`.
+void recordPassStatistics(CompilationStatistics& statistics, const passes::PipelineReport& report) {
+	auto addMs = [&](const std::string& key, double ms) {
+		const auto* existing = statistics.find(key);
+		statistics.set(key, ms + (existing != nullptr && std::holds_alternative<double>(*existing)
+		                              ? std::get<double>(*existing)
+		                              : 0.0));
+	};
+	// read first: the first read expands the deferred groups, one of which sets the key to 0
+	auto addCount = [&](const std::string& key, uint64_t n) {
+		const auto* existing = statistics.find(key);
+		statistics.set(key, static_cast<int64_t>(n) + (existing != nullptr && std::holds_alternative<int64_t>(*existing)
+		                                                   ? std::get<int64_t>(*existing)
+		                                                   : int64_t {0}));
+	};
+	addCount("irPasses.pipelineIterations", report.iterations);
+	addMs("irPasses.totalMs", report.totalMs);
+	for (const auto& pass : report.passes) {
+		const std::string prefix = "irPasses." + pass.name;
+		addMs(prefix + ".ms", pass.ms);
+		addCount(prefix + ".runs", pass.runs);
+		addCount(prefix + ".changes", pass.changes);
+	}
+}
+
+/// Gives the inlining pass the modules that the import link of a compile resolved (13 §4.4.3).
+class LinkImportView final : public passes::ImportView {
+public:
+	explicit LinkImportView(const link::ImportLink& link) : link_(link) {
+	}
+	Exporter exporter(const nir::Module&, uint32_t importIndex) const override {
+		Exporter result;
+		if (importIndex >= link_.bindings.size()) {
+			return result;
+		}
+		const auto& binding = link_.bindings[importIndex];
+		result.name = binding.module;
+		result.hash = binding.exporterHash;
+		if (binding.exporter != nullptr) {
+			result.module = binding.exporter->module();
+		}
+		return result;
+	}
+
+private:
+	const link::ImportLink& link_;
+};
+
+std::unique_ptr<passes::Pass> pluginPass(const ext::PassInfo& info, std::string backend) {
+	return std::make_unique<passes::FunctionPass>(
+	    info.name,
+	    [run = info.run, backend = std::move(backend)](const nir::Module& module, passes::PassContext& context) {
+		    return run(module, ext::PassEnvironment {context.options, backend});
+	    });
+}
+
+/// Whether the optional passes run in a compile (03 §5): not at all with `ir.runPasses=false` or
+/// `ir.runOptimizationPasses=false`, always with `ir.runOptimizationPasses=true`, and otherwise unless the compile is
+/// latency-critical (the tier-0 compile of a module that is promoted).
+bool optionalPassesRun(const engine::ModuleOptions& options, bool latencyCritical) {
+	if (!options.getOptionOrDefault("ir.runPasses", true)) {
+		return false;
+	}
+	if (options.hasOption("ir.runOptimizationPasses")) {
+		return options.getOptionOrDefault("ir.runOptimizationPasses", true);
+	}
+	return !latencyCritical;
+}
+
+/// Runs the passes of one compile for `backendName`: the optional plugin passes of `afterConversion`, the optional core
+/// passes, and the passes of `beforeLowering` (the required ones always). Returns `graph` itself when no pass changed
+/// the module, else a graph with the new module: the module of `graph` is shared by the tiers of a module and stays as
+/// the conversion made it.
+std::shared_ptr<ir::IRGraph> runLoweringPasses(const std::shared_ptr<ir::IRGraph>& graph,
+                                               const std::string& backendName, const engine::ModuleOptions& options,
+                                               CompilationStatistics* statistics, const DumpHandler& dumpHandler,
+                                               bool latencyCritical) {
+	auto& registry = ext::ExtensionRegistry::instance();
+	const bool afterPlugins = registry.hasPassesAt(ext::PassPoint::AfterConversion);
+	const bool beforePlugins = registry.hasPassesAt(ext::PassPoint::BeforeLowering);
+	if (!options.hasIrOptions() && !afterPlugins && !beforePlugins) {
+		return graph; // the default compile: nothing is configured, nothing is asked
+	}
+	const bool optional = optionalPassesRun(options, latencyCritical);
+	const auto which = optional ? passes::optionalPassesOf(options) : passes::OptionalPasses {};
+
+	passes::PassManager manager;
+	if (optional && afterPlugins) {
+		std::vector<std::unique_ptr<passes::Pass>> group;
+		for (const auto* info : registry.passesAt(ext::PassPoint::AfterConversion)) {
+			if (info->requirement == ext::PassRequirement::Optional) {
+				group.push_back(pluginPass(*info, backendName));
+			}
+		}
+		manager.addGroup(std::move(group), 1);
+	}
+	manager.addGroup(passes::makeOptionalPasses(which), which.maxIterations);
+	if (beforePlugins) {
+		std::vector<std::unique_ptr<passes::Pass>> group;
+		for (const auto* info : registry.passesAt(ext::PassPoint::BeforeLowering)) {
+			if (optional || info->requirement == ext::PassRequirement::Required) {
+				group.push_back(pluginPass(*info, backendName));
+			}
+		}
+		manager.addGroup(std::move(group), 1);
+	}
+	if (manager.empty()) {
+		return graph;
+	}
+
+	const auto module = std::static_pointer_cast<const nir::Module>(graph->getNirModule());
+	std::vector<std::string> notes;
+	std::vector<passes::PassContext::InlinedImport> inlinedImports;
+	passes::PassContext context {options};
+	context.notes = statistics != nullptr ? &notes : nullptr;
+	context.inlinedImports = &inlinedImports;
+	std::optional<LinkImportView> imports;
+	if (const auto* link = static_cast<const link::ImportLink*>(graph->getImportLink().get()); link != nullptr) {
+		imports.emplace(*link);
+		context.imports = &*imports;
+	}
+	const bool verify = options.getOptionOrDefault("tracing.verifyNir", false) ||
+	                    options.getOptionOrDefault("ir.verifyAfterEachPass", false);
+	passes::PipelineReport report;
+	auto result = manager.run(*module, context, report, [&](const nir::Module& changed, std::string_view pass) {
+		if (verify) {
+			verifyOrThrow(changed, "the module after the pass " + std::string(pass), module.get());
+		}
+	});
+	if (statistics != nullptr) {
+		recordPassStatistics(*statistics, report);
+		if (!notes.empty()) {
+			std::string text;
+			for (const auto& n : notes) {
+				text += n + "\n";
+			}
+			statistics->set("irPasses.inline.decisions", text);
+		}
+		if (!inlinedImports.empty()) {
+			std::string text;
+			for (const auto& i : inlinedImports) {
+				text += i.module + "." + i.function + "=" + (i.hash ? i.hash->hex() : std::string("unknown")) + ";";
+			}
+			statistics->set("irPasses.inline.importedModules", text);
+		}
+	}
+	if (!result) {
+		return graph;
+	}
+	auto derived = std::make_shared<ir::IRGraph>(graph->getId());
+	auto changed = std::make_shared<const nir::Module>(std::move(*result));
+	dumpHandler.dump("after_nir_passes", "nir", [&]() { return nir::print(*changed); });
+	derived->setNirModule(std::move(changed));
+	derived->setImportLink(graph->getImportLink());
+	return derived;
+}
+
+/// The plugin passes that run on the module the conversion made, in every compile and once for all tiers of a module:
+/// the *required* passes of `afterConversion`. They are part of what the module means (the partition pass of the GPU
+/// plugin), so they run whatever the options say.
+nir::Module runRequiredPluginPasses(nir::Module module, const engine::ModuleOptions& options,
+                                    CompilationStatistics* statistics, bool verify) {
+	passes::PassManager manager;
+	std::vector<std::unique_ptr<passes::Pass>> group;
+	for (const auto* info : ext::ExtensionRegistry::instance().passesAt(ext::PassPoint::AfterConversion)) {
+		if (info->requirement == ext::PassRequirement::Required) {
+			group.push_back(pluginPass(*info, {}));
+		}
+	}
+	manager.addGroup(std::move(group), 1);
+	if (manager.empty()) {
+		return module;
+	}
+	passes::PassContext context {options};
+	passes::PipelineReport report;
+	auto result = manager.run(module, context, report, [&](const nir::Module& changed, std::string_view pass) {
+		if (verify) {
+			verifyOrThrow(changed, "the module after the pass " + std::string(pass), &module);
+		}
+	});
+	if (statistics != nullptr) {
+		recordPassStatistics(*statistics, report);
+	}
+	return result ? std::move(*result) : std::move(module);
+}
+
 } // namespace
 
 std::shared_ptr<ir::IRGraph> CompilationPipeline::traceToNir(std::list<CompilableFunction>& functions,
@@ -316,6 +558,7 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::traceToNir(std::list<Compilabl
 	if (statistics != nullptr) {
 		statistics->recordTimingMs("tracing.ms", tracingStart);
 		recordTracingStatistics(*statistics, traced.statistics);
+		recordTracingDiagnostics(*statistics, traced.diagnostics);
 	}
 	dumpHandler.dump("after_nir_tracing", "nir", [&]() { return nir::print(traced.module); });
 
@@ -325,14 +568,32 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::traceToNir(std::list<Compilabl
 	if (verify) {
 		verifyOrThrow(traced.module, "the pre-SSA NIR of the trace");
 	}
+	if (moduleOptions.hasIrOptions()) {
+		warnRemovedPassOptions(moduleOptions);
+	}
 	auto ssa = convertToSSA(traced.module, moduleOptions, statistics, verify,
 	                        moduleOptions.getOptionOrDefault<std::string>("tracing.nirAttributesFile", ""));
 	dumpHandler.dump("after_nir_conversion", "nir", [&]() { return nir::print(ssa); });
+	if (ext::ExtensionRegistry::instance().hasPassesAt(ext::PassPoint::AfterConversion)) {
+		ssa = runRequiredPluginPasses(std::move(ssa), moduleOptions, statistics, verify);
+	}
 
 	// The graph carries the module to the backend: a NIR backend compiles it as it is, the others get the 0.3 IR built
 	// from it (`lowerToIR`).
+	// A module that is named or imports others takes part in the module registry of its engine (13 §4.4): the session
+	// of this compile resolves its imports against the compiled modules and the backends call through the slots.
+	auto* linkSession = engine::details::LinkSession::current();
+	std::shared_ptr<const void> importLink;
+	if (linkSession != nullptr) {
+		importLink = link::prepareModule(*linkSession, ssa);
+	}
 	auto carrier = std::make_shared<ir::IRGraph>(irArenaPool_->acquire(), compilationId);
-	carrier->setNirModule(std::make_shared<const nir::Module>(std::move(ssa)));
+	auto finalModule = std::make_shared<const nir::Module>(std::move(ssa));
+	if (linkSession != nullptr) {
+		link::noteCompiledModule(*linkSession, finalModule);
+	}
+	carrier->setNirModule(std::move(finalModule));
+	carrier->setImportLink(std::move(importLink));
 	if (statistics != nullptr) {
 		statistics->recordTimingMs("frontend.totalMs", frontendStart);
 	}
@@ -383,17 +644,14 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 	}
 
 	// The default front end: the direct NIR tracer and the conversion. `tracing.nirTracer=false` selects the 0.3
-	// pipeline below, kept as a fallback for one release, and so do the options below.
-	// Debug information and perf need the source tags and region tables of the 0.3 trace, which NIR gets with the debug
-	// producers of M4.9, so `debug`, `perf` and `perf.sample` select it as well.
-	// A backend pinned with `engine.backend` can ask for it too (`CompilationBackend::needs03Frontend`).
+	// pipeline below, kept as a fallback for one release, and so does `dump.copySites`, which needs its tags.
+	// `debug`, `perf` and `perf.sample` stay on this pipeline: the NIR tracer records the debug sections they need (the
+	// regions and function locations, 13 §4.9) when one of them is set, and the backends read them (M4.8).
+	// A backend pinned with `engine.backend` can ask for the 0.3 pipeline too (`CompilationBackend::needs03Frontend`).
 	const auto pinnedBackend = moduleOptions.getOptionOrDefault<std::string>("engine.backend", "");
 	const bool backendNeeds03 = !pinnedBackend.empty() && backends->hasBackend(pinnedBackend) &&
 	                            backends->getBackend(pinnedBackend)->needs03Frontend();
-	const bool needs03Trace = backendNeeds03 || moduleOptions.getOptionOrDefault("dump.copySites", false) ||
-	                          moduleOptions.getOptionOrDefault("debug", false) ||
-	                          moduleOptions.getOptionOrDefault("perf", false) ||
-	                          moduleOptions.getOptionOrDefault("perf.sample", false);
+	const bool needs03Trace = backendNeeds03 || moduleOptions.getOptionOrDefault("dump.copySites", false);
 	if (moduleOptions.getOptionOrDefault("tracing.nirTracer", true) && !needs03Trace) {
 		return traceToNir(functions, moduleOptions, statistics, compilationId, dumpHandler);
 	}
@@ -528,6 +786,14 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 	return ir;
 }
 
+CompilationUnitID CompilationPipeline::unitIdOf(const ir::IRGraph& ir) {
+	return ir.getId();
+}
+
+bool CompilationPipeline::carriesOnlyNir(const ir::IRGraph& ir) {
+	return ir.getNirModule() != nullptr && ir.getFunctionOperations().empty();
+}
+
 void CompilationPipeline::prepareFor(const std::shared_ptr<ir::IRGraph>& ir, const std::string& backendName,
                                      const engine::ModuleOptions& moduleOptions,
                                      CompilationStatistics* statistics) const {
@@ -542,11 +808,12 @@ void CompilationPipeline::prepareFor(const std::shared_ptr<ir::IRGraph>& ir, con
 	lowerToIR(*ir, moduleOptions, statistics, dumpHandler);
 }
 
-std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr<ir::IRGraph>& ir,
-                                                           const std::string& backendName,
-                                                           const engine::ModuleOptions& moduleOptions,
-                                                           CompilationStatistics* statistics) const {
-	const CompilationUnitID compilationId = createCompilationUnitID();
+std::unique_ptr<Executable>
+CompilationPipeline::compileIR(const std::shared_ptr<ir::IRGraph>& ir, const std::string& backendName,
+                               const engine::ModuleOptions& moduleOptions, CompilationStatistics* statistics,
+                               const CompilationUnitID& unitId, const nirbackend::CancellationToken* cancellation,
+                               bool latencyCritical) const {
+	const CompilationUnitID compilationId = unitId.empty() ? createCompilationUnitID() : unitId;
 	auto dumpHandler = DumpHandler(moduleOptions, compilationId);
 
 	if (statistics != nullptr) {
@@ -556,9 +823,17 @@ std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr
 		statistics->set("backend.name", backendName);
 	}
 
-	prepareFor(ir, backendName, moduleOptions, statistics);
+	// the passes of this compile (03 §5) work on a copy of the module: the graph's own is shared by the tiers
+	auto graph = ir;
+	if (carriesOnlyNir(*ir)) {
+		graph = runLoweringPasses(ir, backendName, moduleOptions, statistics, dumpHandler, latencyCritical);
+	}
+	prepareFor(graph, backendName, moduleOptions, statistics);
 	const auto backend = backends->getBackend(backendName);
-	auto executable = backend->compile(ir, dumpHandler, moduleOptions, statistics);
+	auto executable = backend->compile(graph, dumpHandler, moduleOptions, statistics, cancellation);
+	if (executable == nullptr) {
+		return nullptr; // cancelled
+	}
 	executable->setGeneratedFiles(dumpHandler.getGeneratedFiles());
 	return executable;
 }
@@ -572,8 +847,18 @@ std::shared_ptr<ir::IRGraph> CompilationPipeline::compileToIR(std::list<Compilab
 }
 
 std::unique_ptr<Executable> CompilationPipeline::compileIR(const std::shared_ptr<ir::IRGraph>&, const std::string&,
-                                                           const engine::ModuleOptions&, CompilationStatistics*) const {
+                                                           const engine::ModuleOptions&, CompilationStatistics*,
+                                                           const CompilationUnitID&,
+                                                           const nirbackend::CancellationToken*, bool) const {
 	throw RuntimeException("Jit not initialised");
+}
+
+CompilationUnitID CompilationPipeline::unitIdOf(const ir::IRGraph&) {
+	return {};
+}
+
+bool CompilationPipeline::carriesOnlyNir(const ir::IRGraph&) {
+	return false;
 }
 
 void CompilationPipeline::prepareFor(const std::shared_ptr<ir::IRGraph>&, const std::string&,

@@ -19,6 +19,7 @@ Since the cut-over (plan PR 6) the engine's default pipeline traces to NIR and c
 | `Printer.*`, `Parser.*` | the text form | §9 |
 | `Canonicalize.*`, `Hash.*` | canonical form, structural hash (XXH3-128, vendored in `third_party/xxhash`), key of inlined imports | §7 |
 | `Image.*`, `ImageLoader.*`, `Inspect.*` | the binary image: writer, loader (`NIR-L` codes), description without materializing | §8 |
+| `../passes/*` | the optional copy passes (LICM, strength reduction, inlining) and the pass manager, `../passes/AGENTS.md` | 03 §5 |
 | `../common/OptionRegistry.*` | the typed option registry; compiled into `nautilus-nir` for now | M1.4a |
 
 ## Rules that are easy to break
@@ -37,6 +38,11 @@ Since the cut-over (plan PR 6) the engine's default pipeline traces to NIR and c
 - **Canonical form is the hash input.** Anything that changes `canonicalize` or the image layout changes every cache key:
   that is a format change (spec §8.2), including the golden images (`NIR_UPDATE_GOLDEN=1 nautilus-nir-tests` rewrites
   them; review the diff).
+- **Debug data is parallel to `insts`.** `debugInstRegions` and `debugInstLocations` have one entry per instruction of the
+  module (all functions), so a pass that rebuilds the instruction array writes them anew; `Module::regionOf(function, id)`
+  reads one. `Module::copyTables` copies them like every table, which is wrong for a module with other instructions: the
+  conversion clears them before it writes its own. `print(module, PrintLines&)` is the text form plus the line of every
+  instruction, block and function, for the backends that point debug information or a profile at the text.
 - **Only SSA-level modules are canonicalized and hashed.** Pre-SSA modules are written as they are, for reproducers.
 
 ## Testing

@@ -138,6 +138,9 @@ public:
 			bind(exitLabel_);
 			emit(Op::RET, kNoReg);
 		}
+		if (program_.recordSources) {
+			out_.nirInst.resize(out_.code.size(), nir::NONE);
+		}
 		patchFixups();
 		finalize();
 	}
@@ -338,6 +341,9 @@ private:
 		const auto& block = blocks_[b];
 		for (uint32_t k = block.argCount; k < block.count; ++k) {
 			lowerInstruction(block.first + k);
+			if (program_.recordSources) {
+				out_.nirInst.resize(out_.code.size(), block.first + k);
+			}
 			releaseAfter(block.first + k);
 		}
 	}
@@ -810,6 +816,9 @@ private:
 		for (size_t i = 0; i < cold_.size(); ++i) {
 			cold_[i]();
 		}
+		if (program_.recordSources) {
+			out_.nirInst.resize(out_.code.size(), nir::NONE);
+		}
 	}
 
 	// ---- calls ------------------------------------------------------------------------------------------------
@@ -899,8 +908,33 @@ private:
 			return emitNativeCall(std::move(site), info->fallback, args, dst, info->captureThunk);
 		}
 		case CalleeKind::Imported:
-			throw NotImplementedException("tbc: imported callees come with modules and linking (M4.6)");
+			return lowerImportedCall(std::move(site), callee, args, dst);
 		}
+	}
+
+	/// A call of an exported function of another module (13 §5.7): load the entry point from the import slot and call
+	/// it with the C convention of the signature. The slot is read with a plain load, which the target orders: the call
+	/// depends on the loaded address.
+	void lowerImportedCall(CallSite site, const nir::CalleeRecord& callee, const CallArgs& args, uint16_t dst) {
+		if (host_.imports == nullptr) {
+			throw RuntimeException("tbc: the module calls an imported function but was not linked");
+		}
+		const auto slot = callee.target;
+		const auto target = newRegister();
+		emit(memoryOp(Op::LOAD_i8, TypeId::Ptr), target,
+		     constSlot(reinterpret_cast<uint64_t>(host_.imports->address(slot))));
+		void* thunk = args.unwind == nir::NO_UNWIND ? nullptr : host_.imports->captureThunk(slot);
+		if (thunk == nullptr) {
+			emit(Op::CALL_IND, dst, target, addCallSite(std::move(site)));
+		} else {
+			// the exporter may be code that throws natively (a tier that unwinds): the thunk is a C++ frame that
+			// catches it, as for an external call, so that it does not cross the interpreter
+			site.argTypes.insert(site.argTypes.begin(), Type::ptr);
+			site.argRegs.insert(site.argRegs.begin(), target);
+			site.target = thunk;
+			emit(Op::CALL_EXT, dst, addCallSite(std::move(site)));
+		}
+		emitCheckPending(args.unwind);
 	}
 
 	void emitNativeCall(CallSite site, void* target, const CallArgs& args, uint16_t dst,
@@ -958,7 +992,9 @@ private:
 			address = reinterpret_cast<uint64_t>(nirbackend::resolvePointer(m_, callee.target, host_));
 			break;
 		case CalleeKind::Imported:
-			throw NotImplementedException("tbc: imported callees come with modules and linking (M4.6)");
+			// the stub that calls through the import slot (13 §5.7) is not built by any backend yet; nothing in the C++
+			// front end takes the address of an imported function
+			throw NotImplementedException("tbc: the address of an imported function (funcaddr) is not supported");
 		case CalleeKind::Intrinsic:
 			throw RuntimeException("tbc: an intrinsic has no address");
 		}
